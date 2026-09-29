@@ -1,0 +1,94 @@
+---
+title: "Client API and lifecycle"
+description: "React hooks, raw TypeScript methods, cache behavior, and reconnect semantics."
+---
+
+import { Tab, Tabs } from "fumadocs-ui/components/tabs";
+
+`@tetherdb/react` is a thin layer over `@tetherdb/client`, so both packages cache, subscribe, and send mutations the same way. The React package targets React 19.
+
+## Connection ownership
+
+<Tabs items={["React", "TypeScript"]}>
+<Tab value="React">
+
+```tsx
+import { TetherProvider } from "@tetherdb/react";
+
+export function Root() {
+  return <TetherProvider url="ws://localhost:8080/tether">
+    <App />
+  </TetherProvider>;
+}
+```
+
+`App` is your application component. The provider creates a client, connects when it mounts, and disconnects when it unmounts. Changing `url` opens a new connection. Every Tether hook must be rendered inside the provider, so place it high enough to cover all views that use live data.
+
+</Tab>
+<Tab value="TypeScript">
+
+```ts
+import { TetherClient } from "@tetherdb/client";
+
+const client = new TetherClient();
+client.connect("ws://localhost:8080/tether");
+// Share this instance across the application.
+// Call client.disconnect() when its owner is disposed.
+```
+
+The client needs the global `WebSocket` and `crypto.randomUUID`. Every modern browser has both. If you run it elsewhere, such as in a server runtime, check that both are available.
+
+</Tab>
+</Tabs>
+
+Use `wss://` when your site is served over HTTPS. Tokens are sent inside the connection, never in the URL.
+
+## React exports
+
+| API | Contract |
+| --- | --- |
+| `TetherProvider` | Props: `url`, `children` |
+| `useQuery<T>(name, params?)` | Returns `{ data: T \| undefined, error: TetherError \| null }`; params default to `{}` |
+| `useQuery<T>(name, "pass")` | Skips the subscription and returns the empty result |
+| `useMutation<TParams, TResult>(name)` | Returns `{ mutate, isPending, error }`; `mutate(params)` resolves to `TResult` or throws |
+| `useTether()` | Returns `{ tetherClient, token, setToken, logout, authState }` |
+| `Authenticated`, `Unauthenticated` | Render children only when `authState.authenticated` is true or false, respectively. See [what that means for anonymous visitors](./authentication.mdx#decide-whether-to-allow-anonymous-visitors) |
+
+The package also exports the `QueryResult` and `AuthState` types. To use the `TetherError` class, import it from `@tetherdb/client`.
+
+The hooks don't include pagination, optimistic updates, runtime schema validation, or a connection-status hook. If you've used similar libraries, don't assume their APIs exist here. Build those features on top of the methods listed on this page.
+
+A query's `data` starts as `undefined`, and an empty array means it loaded with no results. During server-side rendering, queries have no data; results arrive once the browser connects. In frameworks with client component boundaries, such as the Next.js App Router, put the provider and hooks in client components.
+
+## TypeScript methods
+
+| Method | Behavior |
+| --- | --- |
+| `connect(url)` | Opens or replaces the WebSocket connection |
+| `disconnect()` | Closes it and disables automatic reconnect |
+| `subscribe(name, params, callback)` | Callback receives `(data, error)`; returns an unsubscribe function |
+| `getCache(name, params)` | Reads cached data, or undefined |
+| `getError(name, params)` | Reads a cached query error, or undefined |
+| `sendMutation(name, params)` | Returns a promise for the result |
+| `setToken(token)` | Stores and sends the token; does not await verification |
+| `getAuthState()` | Returns the current `{ authenticated, userId, error }` snapshot |
+| `onAuthentication(callback)` | Calls back immediately and on changes; returns cleanup |
+| `logout()` | Clears auth/query state, rejects pending mutations, and replaces the socket |
+
+Params must be a JSON object. Key order doesn't matter: `{ a: 1, b: 2 }` and `{ b: 2, a: 1 }` refer to the same subscription. Listeners for the same query and params share one server subscription and one cache entry. When the last one unsubscribes, both are removed. If one listener throws, the others still get their updates.
+
+## Reconnects and cached data
+
+If the connection drops unexpectedly, the client reconnects automatically. It waits longer after each failed attempt, adds some randomness, and never waits more than 30 seconds between attempts. Once reconnected, it sends its token again and restores every active subscription. Calling `disconnect()` stops reconnecting.
+
+While disconnected, or after a query error, the last cached result may still be on screen. It doesn't prove the connection is healthy or that the user still has access. Show errors before protected content, and use `logout()` when a user signs out.
+
+`authenticated` can be true for an anonymous visitor, depending on your verifier. See [Authentication](./authentication.mdx#decide-whether-to-allow-anonymous-visitors).
+
+## Mutation delivery
+
+Each mutation has 10 seconds to complete, starting when you call it. If the socket isn't open yet, the mutation waits in a queue. It's sent once the connection opens, as long as its 10 seconds haven't run out; otherwise it's dropped. When the connection closes, pending mutations are rejected and unsent ones are discarded. `logout()` does the same.
+
+Once a mutation has been sent, a timeout or disconnect can't take it back. A rejected promise doesn't prove the server skipped the write; it may have committed. The client never re-sends a mutation automatically. If retries must be safe, use an idempotency key (see [Mutations](./mutations.mdx#timeouts-and-retries)).
+
+Results are plain JSON. Keep your TypeScript types in sync with your Go `json` tags, and validate data you don't trust. Send IDs as strings if they might exceed JavaScript's safe integer range (2⁵³ − 1).

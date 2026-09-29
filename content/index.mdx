@@ -1,0 +1,27 @@
+---
+title: "Tether documentation"
+description: "Build a reactive backend in Go and keep your clients in sync."
+---
+
+Tether is a reactive backend framework for Go. You write queries and mutations as Go functions. Tether tracks the data each query reads and pushes fresh results to connected clients over WebSockets whenever that data changes.
+
+The examples use a Go server with a React client. Client examples also have a **TypeScript** tab for apps that use `@tetherdb/client` directly.
+
+## Start building
+
+- [Quick start](./quick-start.mdx): build a live message board with SQLite and React.
+- [What is Tether?](./what-is-tether.mdx): how Tether works and where it fits.
+- [Queries](./queries.mdx) and [mutations](./mutations.mdx): read live data and change it.
+- [Reactivity](./reactivity.mdx): control when queries re-run.
+
+## Build an application
+
+Add [authentication](./authentication.mdx) and [guards](./guards.mdx), group related writes with [transactions](./transactions.mdx), upload [files](./storage.mdx), and run [scheduled work](./scheduling.mdx).
+
+The [database guide](./database.mdx) covers models and migrations. The [client reference](./clients.mdx) covers hooks, subscriptions, errors, and reconnects. Use [profiling](./profiling.mdx) to find slow server work, then follow [deployment](./deployment.mdx) to go live.
+
+## What these docs cover
+
+These docs describe version 1 of the Tether Go engine and the `@tetherdb/react` and `@tetherdb/client` 1.0 packages. Go examples use GORM with SQLite or PostgreSQL. TypeScript types in the examples describe your app's JSON responses; Tether doesn't generate them from your Go models.
+
+[Server API reference](./server-api.mdx) · [Troubleshooting](./troubleshooting.mdx) · [Go source](https://github.com/recodeorg/tether)

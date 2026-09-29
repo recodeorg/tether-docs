@@ -1,0 +1,103 @@
+---
+title: "Mutations"
+description: "Validate commands, authorize writes, and return useful results."
+---
+
+import { Tab, Tabs } from "fumadocs-ui/components/tabs";
+
+A mutation is a named Go function that runs once each time a client calls it. It can write to the database through `ctx.DB`, work with file storage, and schedule later work. When it writes, Tether automatically refreshes the queries that depend on the changed data.
+
+## Register a command
+
+This example uses the `Message` model from [Database and models](./database.mdx) and the `isMember` guard from [Guards](./guards.mdx).
+
+```go
+engine.RegisterMutation("sendMessage", func(ctx *tether.MutationCtx) (any, error) {
+    room, roomOK := ctx.Params["room"].(string)
+    body, bodyOK := ctx.Params["body"].(string)
+    body = strings.TrimSpace(body)
+    if !roomOK || room == "" || !bodyOK || body == "" || len(body) > 1000 {
+        return nil, errors.New("invalid message")
+    }
+    allowed, err := ctx.Auth.ExecuteGuard("isMember", map[string]interface{}{"room": room})
+    if err != nil || allowed != true {
+        return nil, errors.New("forbidden")
+    }
+    message := Message{RoomID: room, Body: body}
+    if err := ctx.DB.Create(&message).Error; err != nil {
+        return nil, errors.New("could not save message")
+    }
+    return message, nil
+})
+```
+
+Check permissions in every public mutation, even when a query already checks the same thing. A client can call any mutation directly, whether or not it ever ran your query.
+
+In a mutation, `ExecuteGuard` runs the guard fresh every time; nothing is cached. The guard's check and your write still happen separately. If another request could change permissions between them, and that matters, do the check inside the same [transaction](./transactions.mdx) as the write. Use row locks or database constraints as needed.
+
+## Call the mutation
+
+<Tabs items={["React", "TypeScript"]}>
+<Tab value="React">
+
+```tsx
+import { useMutation } from "@tetherdb/react";
+
+type Message = { id: number; roomId: string; body: string };
+
+export function SendButton() {
+  const { mutate, isPending, error } = useMutation<
+    { room: string; body: string }, Message
+  >("sendMessage");
+  return <>
+    <button disabled={isPending} onClick={async () => {
+      try {
+        await mutate({ room: "general", body: "Hello!" });
+      } catch {
+        // The hook also exposes this error for rendering.
+      }
+    }}>Send</button>
+    {error && <p role="alert">{error.message}</p>}
+  </>;
+}
+```
+
+The first type parameter describes the params and the second describes the result.
+
+`mutate` returns a promise. If the mutation fails, the promise rejects *and* the hook's `error` is set, so always catch the promise in event handlers. `isPending` stays true while any call made through this hook is still in flight.
+
+</Tab>
+<Tab value="TypeScript">
+
+```ts
+// client is your connected TetherClient.
+try {
+  const result = await client.sendMutation("sendMessage", {
+    room: "general", body: "Hello!",
+  });
+  console.log(result);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+}
+```
+
+`sendMutation` returns `Promise<unknown>`. Cast or validate the result to your own type before using it.
+
+</Tab>
+</Tabs>
+
+## Input and output contracts
+
+Treat params as untrusted input: anyone can send any JSON. On the server, check types, lengths, ranges, and whether the caller owns what they're changing. TypeScript types on the client don't validate anything at runtime.
+
+Numbers arrive in Go as `float64`. Before converting one to an integer ID, check that it's a positive whole number. Alternatively, send IDs as strings.
+
+Return `(value, nil)` on success and `(nil, error)` on failure. The value must be JSON-serializable. Clients see your error messages, so make them safe to display.
+
+Returning an error doesn't undo writes the mutation already made. When several writes must succeed or fail together, use a [transaction](./transactions.mdx).
+
+## Timeouts and retries
+
+The client gives up on a mutation after **10 seconds**, counting any time spent waiting to connect. A timeout or dropped connection doesn't mean the write failed. The server may have finished it anyway.
+
+Tether currently doesn't queue mutations for offline replay or detect duplicate requests. If an operation must never happen twice, such as a payment or creating a job, have the client send a unique request ID and enforce uniqueness in your database. Don't blindly retry these operations. See [client lifecycle](./clients.mdx) for details.

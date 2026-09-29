@@ -1,0 +1,77 @@
+---
+title: "Troubleshooting and testing"
+description: "Diagnose stale results, connection failures, auth errors, and uncertain writes."
+---
+
+## The browser cannot connect
+
+Check that the Go server is running and that the client URL's path exactly matches where you mounted `engine.Handle`. Pages served over HTTPS must connect with `wss://`, not `ws://`.
+
+Check the page's exact origin, including the port. The [quick start](./quick-start.mdx) allows `http://localhost:5173`, so opening the same app at `http://127.0.0.1:5173` is rejected as a different origin. If you use a reverse proxy, make sure it forwards WebSocket upgrades. The server also closes the connection if a client sends a message larger than 8 KiB.
+
+## Existing rows update, but new rows don't appear
+
+Automatic tracking only covers rows the query already loaded. To pick up new rows, or to update a result that started out empty, add `TrackCollection` or `TrackTable`. A collection's field needs the `tether:"track"` tag, and tracking calls use database names like `room_id`, not JSON names like `roomId`.
+
+Make sure writes go through GORM model methods on the engine's handle. Changes made by a separate SQL script won't trigger updates. For counts, aggregates, and partial selects, track the relevant tables or collections explicitly.
+
+## A query fails when it tries to write
+
+Queries and guards get read-only database handles, so move the write into a mutation. Don't get around the restriction by writing through a different database handle. Tether can re-run a query at any time and share one run between subscribers, so writes from a query would happen unpredictably.
+
+## The client says `authenticated`, but nobody is signed in
+
+If your verifier accepts the empty token that clients send before sign-in, anonymous visitors are reported as `authenticated: true` with `userId: null`. The default verifier (used when you don't call `SetAuth`) does this for every token.
+
+You can fix this in either of two ways:
+
+- Check `authState.userId` instead of `authenticated` when you need a signed-in user.
+- Make your verifier return an error for an empty token, so `authenticated` stays false until a real sign-in. See [Authentication](./authentication.mdx#decide-whether-to-allow-anonymous-visitors).
+
+On the server, always check `userID == ""`. An anonymous caller gets an empty ID with no error.
+
+If a replacement token is rejected, the server keeps the connection's previous identity. To sign out, use `logout()`, which clears client state and opens a fresh connection. `<Authenticated>` and `<Unauthenticated>` only control what's displayed; your server still has to check permissions.
+
+## Permissions change, but private data stays on screen
+
+Make sure the guard tracks the data that grants access, including rows that don't exist yet, such as new memberships. Also make sure every handler rejects a `false` result.
+
+After a query error, the client may still hold the last successful result, so render errors before cached data. Clear your app's own private state when a user signs out. Data a client already received can't be taken back.
+
+## A mutation fails or times out
+
+Always catch the promise returned by `mutate` or `sendMutation`. React's `error` field shows the failure, but the promise still rejects. Validate params in Go and return errors that are safe to display.
+
+Mutations time out 10 seconds after you call them, but the server may have committed the write anyway. Check the resulting data, or use an idempotency key, before retrying. An error doesn't roll back earlier writes unless you used a transaction.
+
+## Storage URLs fail
+
+Mount `StorageHandler` on the full configured prefix, without `StripPrefix`. Upload and download URLs are paths, so combine them with your server's address. Upload the file as the raw request body with a `Content-Type` header, not as `FormData`.
+
+Also check:
+
+- the origin allowlist,
+- whether the URL has expired,
+- whether the upload URL was already used, since each works once,
+- the configured size limit and your proxy's request body limit.
+
+Download URLs expire after 15 minutes; request a new one when needed. With local storage, the upload directory must persist and be reachable by whichever instance serves the file.
+
+## Scheduled work fails
+
+Register the target mutation on every instance. Params arrive as JSON, so numbers are `float64`. Scheduled mutations have no caller: they can't call guards, and `GetIdentity()` returns `tether.ErrNoCaller`.
+
+Failed one-time tasks aren't retried, so check the server logs. Make jobs safe to run twice, and remember that scheduling isn't part of your mutation's transaction. Use the same time zone on every server that runs crons.
+
+## Testing your application
+
+Use a temporary database and close the engine after each test. Test what users will see, not just what handlers return:
+
+1. Subscribe to an empty result, insert a matching row, and check that the subscriber updates.
+2. Move a row from one tracked collection to another, and check that both subscribers update.
+3. Revoke a membership through a mutation, and check that the protected query now denies access.
+4. Roll back a transaction, and check that no uncommitted data reaches clients.
+5. Disconnect and reconnect a client, and check that its subscriptions resume.
+6. Simulate a mutation whose outcome is unknown, and check that your retry handling is safe.
+
+Test multi-instance behavior against PostgreSQL. SQLite can't test notifications between instances. Keep at least one real-browser test that covers your origin settings and proxy routing.

@@ -1,0 +1,82 @@
+---
+title: "Deployment and scaling"
+description: "Run Tether as a Go service with persistent data and WebSocket routing."
+---
+
+Tether runs inside your own Go HTTP server, so you deploy it like any other Go binary. It needs a persistent database, your token verifier, and storage settings if you use file uploads. Create the engine and register everything before you start accepting requests.
+
+## Single instance
+
+SQLite works for one engine instance. Keep the database file, and the upload directory if you use local storage, on disk that survives redeploys. Back up both.
+
+Don't run several SQLite-backed engine processes for the same app. They can't tell each other about changes, so subscribers on one process won't see writes made on another.
+
+The quick start lets anyone post. Before going to production, add authorization, validate inputs, and apply rate limits that suit your app.
+
+## PostgreSQL and multiple instances
+
+Point every instance at the same PostgreSQL database using `gorm.io/driver/postgres`. Instances notify each other of changes through PostgreSQL itself, and they claim scheduled tasks through the database too. There's no separate message broker to set up.
+
+Every instance should register the same models, queries, mutations, guards, crons, and verifier. During a rolling deploy, old and new versions run side by side, so plan schema changes that both versions can handle.
+
+For file storage, use an S3-compatible adapter or another backend all instances can reach. A local upload directory on one server isn't visible to the others. Switching database or storage backends doesn't move existing data.
+
+Tether listens for PostgreSQL notifications, which needs a long-lived database session. Some connection proxies and poolers don't support that, so test yours. Tether also only sees writes made through its own engines, not writes from other applications that share the database.
+
+## HTTP and origins
+
+```go
+engine.SetAllowedOrigins([]string{"https://app.example.com"})
+mux.HandleFunc("/tether", engine.Handle)
+// If storage is configured:
+mux.HandleFunc("/storage/", engine.StorageHandler)
+```
+
+By default, Tether accepts WebSocket connections only from pages on the same origin as the server. `SetAllowedOrigins` replaces that with an exact list of allowed origins. Each entry must match the scheme, host, and port exactly. The same list controls CORS for storage requests. For custom rules, `SetCheckOrigin(func(*http.Request) bool)` replaces the origin check entirely.
+
+Terminate TLS at your service or reverse proxy, and connect clients with `wss://api.example.com/tether`. Configure your proxy to:
+
+- forward WebSocket upgrade requests,
+- preserve the host and origin headers your origin check relies on,
+- route the full storage path without stripping the prefix,
+- allow request bodies as large as your biggest allowed upload.
+
+A WebSocket connection stays on one instance for its lifetime. When it reconnects, it may land on a different instance, which works fine as long as all instances are configured the same. Long-lived connections can hit proxy idle timeouts, so tune those and test reconnects through your real proxy. A passing HTTP health check doesn't prove WebSockets are forwarded correctly.
+
+## Startup and shutdown
+
+Close the engine before you close the database:
+
+```go
+// Inside startup, after opening db:
+sqlDB, err := db.DB()
+if err != nil {
+    return err
+}
+defer sqlDB.Close()
+engine, err := tether.NewEngine(db)
+if err != nil {
+    return err
+}
+defer engine.Close()
+```
+
+Deferred calls run in reverse order, so `engine.Close()` runs first. When shutting down, stop taking new traffic, let in-flight requests finish, then close the engine and the database pool.
+
+`engine.Close()` waits for running scheduled tasks and profiler callbacks, stops background work, and releases claimed tasks without deleting them. It doesn't close open WebSocket connections, and neither does Go's HTTP server `Shutdown`. Drain connections at the load balancer or proxy, and let clients reconnect to healthy instances.
+
+## Limits and monitoring
+
+Each message a client sends over the WebSocket is limited to **8 KiB**. Keep mutation params small, and send files through [storage](./storage.mdx). Tether also caps the number of subscriptions, and it disconnects clients that fall too far behind instead of buffering results for them indefinitely.
+
+Monitor database errors, connection failures, failed scheduled tasks, and response times. Use [profiling](./profiling.mdx) to dig into specific problems. The engine logs with Go's `log/slog`. In your own handlers, don't log tokens, upload or download URLs, or raw request params.
+
+Before launch, test these through your real domain and proxy:
+
+- two clients seeing each other's changes,
+- access being revoked while a client is subscribed,
+- a transaction rolling back,
+- a client reconnecting,
+- uploading and downloading files.
+
+With multiple instances, also check that a mutation handled by one instance updates a subscriber connected to another.

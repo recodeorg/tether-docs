@@ -1,0 +1,41 @@
+---
+title: "What is Tether?"
+description: "A small Go API for live data, with infrastructure you control."
+---
+
+Tether turns ordinary Go functions into a live backend. A **query** reads data, and Tether remembers which rows and collections it read. A **mutation** writes data. When a mutation's writes commit, Tether re-runs the queries that depend on the changed data and pushes the new results to connected clients.
+
+You own the Go application and the database. Tether handles subscriptions, dependency tracking, and WebSocket delivery.
+
+## Reactive by default
+
+A query is a live computation, not an endpoint clients poll. Rows a query loads are tracked automatically. When a result should also react to new rows, such as an empty list or a count, you declare a collection or table dependency.
+
+When several clients subscribe to the same query with the same parameters, Tether runs it once and sends everyone the result. [Guards](./guards.mdx) keep this sharing working with permissions: each user's access is checked separately, and users with the same access share the query.
+
+Read [Reactivity](./reactivity.mdx) before you write more complex queries. Tether tracks writes made through its database handle, not arbitrary changes elsewhere in your system.
+
+## Secure defaults, your rules
+
+Queries and guards get read-only database handles. Internal functions are hidden from clients. Tether also checks WebSocket origins, limits message sizes, and applies safeguards to file storage by default.
+
+Your application still decides who can read or write each resource, validates parameters, and chooses what data to return. Authentication tells you who the caller is; guards and mutation checks decide what they're allowed to do.
+
+## Infrastructure that grows with your app
+
+Start with SQLite in a single Go process. Move to PostgreSQL when you need multiple instances. Engines that share a PostgreSQL database coordinate updates and scheduled tasks through it, so you don't need Redis or a message broker.
+
+File storage works the same way: start with local disk, then switch to an S3-compatible adapter. Switching adapters doesn't migrate existing files or data for you.
+
+## Philosophy
+
+Tether follows four main principles:
+
+- **Radical simplicity.** Keep the public API small and obvious.
+- **Effortless infrastructure changes.** Make backend swaps straightforward.
+- **No vendor lock-in.** Run a self-contained Go binary on infrastructure you control.
+- **Pluggable, not hard-coded.** Put external infrastructure behind adapters.
+
+Tether fits apps whose screens should reflect database changes as they happen, such as collaborative tools, dashboards, chat, and operational interfaces. It doesn't provide a login service, a UI framework, or a managed database. You bring your identity provider, models, and application rules.
+
+[Build your first app](./quick-start.mdx).

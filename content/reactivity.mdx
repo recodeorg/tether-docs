@@ -1,0 +1,69 @@
+---
+title: "Reactivity and tracking"
+description: "Choose dependencies that keep query results correct without rerunning unrelated work."
+---
+
+While a query or guard runs, Tether records what data it depends on. When a mutation writes through the engine's GORM handle, Tether finds the queries that depend on the changed data, re-runs them, and sends each subscriber the complete new result. It doesn't send row-by-row patches.
+
+## Three kinds of dependency
+
+| Dependency | How to declare it | What triggers a re-run |
+| --- | --- | --- |
+| Row | Automatic: load a model through `ctx.DB` | A change to a row the query already loaded |
+| Collection | `ctx.TrackCollection("messages", "room_id", room)` | Any insert, update, or delete of rows where `room_id` equals `room` |
+| Table | `ctx.TrackTable("messages")` | Any tracked write to the table |
+
+Tether tracks the rows you load automatically. You declare collection and table dependencies yourself.
+
+## New rows and empty results
+
+Row tracking only covers rows the query actually loaded. A message that doesn't exist yet has no row to track. To pick up new messages in a room, declare the collection **before** reading. Do this even when the read returns no rows:
+
+```go
+type Message struct {
+    ID     uint   `gorm:"primaryKey" json:"id"`
+    RoomID string `tether:"track" json:"roomId"`
+    Body   string `json:"body"`
+}
+
+// Inside a query; room is a validated string:
+ctx.TrackCollection("messages", "room_id", room)
+messages := []Message{}
+err := ctx.DB.Where("room_id = ?", room).Find(&messages).Error
+return messages, err
+```
+
+Pass database table and column names, not Go field names or JSON names. The column must have the `tether:"track"` tag on its model field. If an update moves a row from one room to another, both rooms' collections are invalidated.
+
+The same applies to a query that looks up a record that doesn't exist yet. If it should update when the record is created, track a collection or table. Counts, aggregates, results without primary keys, and joins need the same care: track every table or collection that can change the answer.
+
+## Table dependencies
+
+```go
+ctx.TrackTable("messages")
+var count int64
+err := ctx.DB.Model(&Message{}).Count(&count).Error
+return count, err
+```
+
+Tracking a whole table is simple and always correct, but it re-runs the query on every write to that table. When only one room, project, or tenant matters, track a collection instead. Adding a `Where` filter to your read doesn't create a dependency on future rows; only `TrackCollection` and `TrackTable` do.
+
+## Shared execution and identity
+
+Tether groups subscriptions that have the same query, the same parameters, and the same guard results, then runs each group once. Calling `ctx.Auth.GetIdentity()` in a query ties it to the caller, so Tether can only share it between subscriptions from the same user.
+
+Prefer [guards](./guards.mdx) for permissions and for data several users can see. A guard can check access or return the IDs a user is allowed to see, and users who get the same answer share one query execution. Only read identity directly in a query when the result is personal to that user. See [why guards scale better](./guards.mdx#why-guards-scale-better-than-getidentity).
+
+## Commit boundaries
+
+Inside a [transaction](./transactions.mdx), Tether holds invalidations until commit and discards them on rollback. Several writes produce one refresh, and clients never see a half-finished state.
+
+## What Tether can't see
+
+Tether only sees writes made through its own database handles. It isn't change-data capture for the whole database. It won't notice:
+
+- writes from other applications or SQL scripts,
+- raw SQL that bypasses GORM's model callbacks,
+- changes in external APIs, in-memory state, or the clock.
+
+For example, a query that uses `time.Now()` doesn't re-run just because time passes. When a time-based change matters, schedule a mutation that updates tracked data at the right moment.

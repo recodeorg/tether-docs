@@ -1,0 +1,138 @@
+---
+title: "Guards and authorization"
+description: "Check permissions reactively and share authorized query work between users."
+---
+
+A guard is a named, read-only function that answers a question about the current caller, such as "Is this user a member of this room?" or "Which rooms can this user see?" Queries and mutations call guards to decide what the caller can access.
+
+Guards are reactive. Tether tracks the data a guard reads. When that data changes, for example when a user joins or leaves a room, Tether re-runs the guard for the affected user. It re-runs the queries that used the guard only if the guard's answer changed.
+
+Guards also make queries faster. Queries that get the same answer from a guard can share one execution, even when different users are asking. See [why guards scale better than `GetIdentity()`](#why-guards-scale-better-than-getidentity).
+
+## Register a membership guard
+
+```go
+type RoomMember struct {
+    UserID string `gorm:"primaryKey" tether:"track"`
+    RoomID string `gorm:"primaryKey"`
+}
+
+if err := engine.CreateTable(&RoomMember{}); err != nil {
+    return err
+}
+
+engine.RegisterGuard("isMember", func(ctx *tether.GuardCtx) (any, error) {
+    userID, err := ctx.Auth.GetIdentity()
+    if err != nil || userID == "" {
+        return false, nil
+    }
+    room, ok := ctx.Params["room"].(string)
+    if !ok || room == "" {
+        return false, nil
+    }
+    // Track the user's memberships so joining a room also re-runs this guard.
+    ctx.TrackCollection("room_members", "user_id", userID)
+    var member RoomMember
+    err = ctx.DB.Where("user_id = ? AND room_id = ?", userID, room).First(&member).Error
+    if errors.Is(err, gorm.ErrRecordNotFound) {
+        return false, nil
+    }
+    if err != nil {
+        return nil, errors.New("could not check membership")
+    }
+    return true, nil
+})
+```
+
+This snippet uses `errors`, `gorm.io/gorm`, and `github.com/recodeorg/tether`.
+
+The `TrackCollection` call matters. Loading a row tracks that row, but when the user isn't a member there's no row to track. Tracking the user's whole membership collection means a new membership also triggers a re-check. `TrackCollection` requires the `tether:"track"` tag on `UserID`, and membership writes must go through the engine's database handle so Tether sees them.
+
+## Enforce the result
+
+At the start of a query or mutation, after validating `room`:
+
+```go
+allowed, err := ctx.Auth.ExecuteGuard("isMember", map[string]interface{}{"room": room})
+if err != nil || allowed != true {
+    return nil, errors.New("forbidden")
+}
+```
+
+Calling a guard doesn't stop your handler by itself. It only returns an answer. Your handler has to check that answer before reading or writing protected data. Check permissions in mutations too: a guard in a query doesn't protect the mutations that change the same data.
+
+## Use a guard to fetch authorized data
+
+A guard can return more than `true` or `false`. For example, a sidebar that lists "rooms I belong to" can get the user's room IDs from a guard, then load the rooms in the query:
+
+```go
+type Room struct {
+    ID   string `gorm:"primaryKey" json:"id"`
+    Name string `json:"name"`
+}
+
+engine.RegisterGuard("myRooms", func(ctx *tether.GuardCtx) (any, error) {
+    userID, err := ctx.Auth.GetIdentity()
+    if err != nil || userID == "" {
+        return []string{}, nil
+    }
+    ctx.TrackCollection("room_members", "user_id", userID)
+    roomIDs := []string{}
+    err = ctx.DB.Model(&RoomMember{}).Where("user_id = ?", userID).
+        Order("room_id").Pluck("room_id", &roomIDs).Error
+    if err != nil {
+        return nil, errors.New("could not load rooms")
+    }
+    return roomIDs, nil
+})
+
+engine.RegisterQuery("listMyRooms", func(ctx *tether.QueryCtx) (any, error) {
+    result, err := ctx.Auth.ExecuteGuard("myRooms", map[string]interface{}{})
+    if err != nil {
+        return nil, errors.New("could not load rooms")
+    }
+    roomIDs, _ := result.([]interface{})
+    rooms := []Room{}
+    if len(roomIDs) == 0 {
+        return rooms, nil
+    }
+    if err := ctx.DB.Where("id IN ?", roomIDs).Order("name").Find(&rooms).Error; err != nil {
+        return nil, errors.New("could not load rooms")
+    }
+    return rooms, nil
+})
+```
+
+The query never calls `GetIdentity()`. The guard knows who the caller is, and the query only knows which rooms to load. This is the recommended way to serve data that depends on permissions:
+
+- When the user joins or leaves a room, only that user's guard re-runs. If the guard's result changed, their query re-runs with the new list.
+- When a room is renamed, the query re-runs because it loaded that room. It runs once for each group of subscribers that share the same guard result, not once per user.
+
+Keep guard results small, such as IDs, and put them in a consistent order. Tether compares guard results by their JSON, so `["a","b"]` and `["b","a"]` count as different results and won't share an execution. Loading the full records in the query also keeps changes to those records from re-running every user's guard.
+
+## Why guards scale better than `GetIdentity()`
+
+When a tracked write happens, Tether finds every subscription affected by it and groups them into batches. Subscriptions in one batch have the same query, the same parameters, and the same guard results. Tether runs each batch **once** and sends the result to every subscriber in it. When many users get the same guard result, that turns many executions into a few.
+
+Calling `GetIdentity()` in a query makes the result user-specific, so Tether can't batch it across users. On every refresh, the query runs separately for each user subscribed to it. This cost grows with your user count. It's most noticeable on SQLite, which usually runs on a single connection (as in the [quick start](./quick-start.mdx)), so every extra execution waits for the ones before it.
+
+Use each tool for its job:
+
+- **Use guards** for permission checks and for any data that more than one user can share: room contents, team dashboards, documents in a shared project.
+- **Use `GetIdentity()` in a query** only when the result is truly personal: the user's profile, settings, drafts, or notifications.
+
+Mutations aren't batched. Calling `GetIdentity()` in a mutation costs nothing extra.
+
+## Denials, errors, and revocation
+
+For an ordinary "no", return `false, nil` (or an empty result). That's a real answer that Tether caches and tracks like any other. Return an error only when the guard couldn't decide, such as when the database fails. Your handler should treat an error as a denial. If a guard fails while being re-checked, Tether drops its cached result instead of continuing to trust the old one.
+
+When access is revoked, a protected query sends an error, but the client may still hold the last result it received. Show query errors before any cached protected content, and clear private application state when a user signs out. Revoking access blocks future reads; it can't take back data a client already has.
+
+## Guard rules
+
+- Guards are read-only. They get a read-only `DB`, `Params`, `Auth` for `GetIdentity()`, and the `TrackCollection` and `TrackTable` methods.
+- Guards can't call other guards. Share logic with ordinary Go helper functions instead.
+- Guard results go through JSON before your handler sees them. Numbers become `float64`, arrays become `[]interface{}`, and structs become `map[string]interface{}`.
+- In a query, a guard result is cached and kept up to date for as long as the subscription is open. In a mutation, every `ExecuteGuard` call runs the guard fresh.
+- Scheduled mutations have no caller, so they can't call guards.

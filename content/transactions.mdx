@@ -1,0 +1,43 @@
+---
+title: "Transactions"
+description: "Commit related writes together and notify subscribers only after success."
+---
+
+A mutation isn't automatically wrapped in a transaction. If it makes several writes and one fails, the earlier ones stay. When writes must succeed or fail together, use GORM's `Transaction`.
+
+Tether also waits for the transaction to finish before updating anyone. Subscribers are refreshed only after a successful commit. After a rollback, nobody is notified.
+
+## Group related writes
+
+This example uses the `Message` model from [Database and models](./database.mdx). Check that the caller may post to the room before this block. If the permission check must happen atomically with the write, do it inside the transaction too.
+
+```go
+// Inside a mutation, after validating room and body:
+var message Message
+err := ctx.DB.Transaction(func(tx *gorm.DB) error {
+    message = Message{RoomID: room, Body: body}
+    if err := tx.Create(&message).Error; err != nil {
+        return err
+    }
+    // A second write that commits or rolls back with the first.
+    return tx.Model(&message).Update("body", strings.TrimSpace(body)).Error
+})
+if err != nil {
+    return nil, errors.New("could not save message")
+}
+return message, nil
+```
+
+Use **`tx` for every operation** inside the callback. Using `ctx.DB` there runs that operation outside the transaction. With a one-connection pool, it can also deadlock while it waits for the connection the transaction holds.
+
+Return an error from the callback to roll back, or `nil` to commit. Once the transaction commits, affected queries re-run and clients see the committed data.
+
+You can also manage transactions manually with `Begin`, `Commit`, and `Rollback` on the engine's handle. The callback form handles errors for you. If you manage a transaction yourself, always check the error from `Commit`.
+
+## What a rollback doesn't undo
+
+A rollback only undoes database writes made through `tx`. It doesn't undo network requests, uploaded file contents, or scheduled tasks.
+
+`ctx.Scheduler.RunAfter` saves its task separately from your transaction, so the task stays scheduled even if the transaction rolls back. On SQLite with a one-connection pool, don't schedule from inside a transaction. The scheduler needs its own connection, and the transaction is holding the only one.
+
+For simple cases, schedule the task after the transaction commits, and handle a scheduling error if one occurs. If the handoff must be reliable, write an "outbox" record inside the transaction, then have a worker process it. Make the worker safe to run twice. Tether doesn't provide an outbox or distributed transactions for you.

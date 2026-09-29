@@ -1,0 +1,100 @@
+---
+title: "Queries"
+description: "Write read-only Go functions and subscribe from React or TypeScript."
+---
+
+import { Tab, Tabs } from "fumadocs-ui/components/tabs";
+
+A query is a Go function that reads data. Register it once at startup. Each subscriber gets the current result right away, then a new result whenever the data behind it changes.
+
+Tether may run a query many times, and one run can serve many subscribers. Keep queries read-only, and don't call external services or trigger other side effects from them.
+
+## Register a live query
+
+This example uses the `Message` model from [Database and models](./database.mdx).
+
+```go
+engine.RegisterQuery("getMessages", func(ctx *tether.QueryCtx) (any, error) {
+    room, ok := ctx.Params["room"].(string)
+    if !ok || room == "" {
+        return nil, errors.New("room is required")
+    }
+    ctx.TrackCollection("messages", "room_id", room)
+    messages := []Message{}
+    if err := ctx.DB.Where("room_id = ?", room).
+        Order("id ASC").Limit(100).Find(&messages).Error; err != nil {
+        return nil, errors.New("could not load messages")
+    }
+    return messages, nil
+})
+```
+
+Anyone can call this query. To protect private rooms, check membership with a [guard](./guards.mdx) before reading.
+
+A few habits keep queries reliable:
+
+- Validate every parameter. JSON numbers arrive as `float64`.
+- Check database errors, and return a safe message instead of the raw error.
+- Start with an empty slice (`[]Message{}`) so clients receive `[]` instead of `null` when there are no rows.
+
+## Subscribe
+
+<Tabs items={["React", "TypeScript"]}>
+<Tab value="React">
+
+```tsx
+import { useQuery } from "@tetherdb/react";
+
+type Message = { id: number; roomId: string; body: string };
+
+export function Room({ room }: { room: string | null }) {
+  const { data, error } = useQuery<Message[]>(
+    "getMessages", room ? { room } : "pass",
+  );
+  if (!room) return <p>Select a room.</p>;
+  if (error) return <p role="alert">{error.message}</p>;
+  if (data === undefined) return <p>Loading…</p>;
+  return <ul>{data.map(m => <li key={m.id}>{m.body}</li>)}</ul>;
+}
+```
+
+Render this under `TetherProvider`. Passing `"pass"` instead of params skips the subscription, so you never have to call a hook conditionally.
+
+There's no `isLoading` flag. Check `error` first, then treat `data === undefined` as loading. Checking the error first matters: after an error, `data` may still hold the last successful result, and a protected view shouldn't keep showing it.
+
+</Tab>
+<Tab value="TypeScript">
+
+```ts
+import { TetherClient } from "@tetherdb/client";
+
+const client = new TetherClient();
+client.connect("ws://localhost:8080/tether");
+const unsubscribe = client.subscribe("getMessages", { room: "general" }, (data, error) => {
+  if (error) {
+    console.error(error.message);
+    return;
+  }
+  console.log(data);
+});
+
+// When this view is disposed:
+// unsubscribe();
+// When the application is disposed:
+// client.disconnect();
+```
+
+Keep the function `subscribe` returns and call it when you're done. Subscribing to the same query with the same params again reuses the existing subscription. When the last listener unsubscribes, the client drops the subscription and its cached data.
+
+</Tab>
+</Tabs>
+
+## Capabilities and visibility
+
+`QueryCtx` provides `DB`, `Params`, `Auth`, `Storage`, `TrackCollection`, and `TrackTable`. Its database handle rejects any write. From `Storage`, queries can create download URLs, but uploads and deletions have to happen in a mutation.
+
+Passing `tether.Internal()` to `RegisterQuery` hides the query from clients. Tether currently has no API for running a query from your own server code, so an internal query can't be used as a helper. Write an ordinary Go function for shared logic instead.
+
+Tether shares one query execution between subscribers when it can, which makes queries cheap to serve at scale. Calling `ctx.Auth.GetIdentity()` in a query turns that sharing off between users. Use [guards](./guards.mdx#why-guards-scale-better-than-getidentity) for permission-dependent data, and read identity directly only for personal results.
+
+Read [Reactivity](./reactivity.mdx) to learn how to handle new rows, empty results, and aggregates.

@@ -1,0 +1,149 @@
+---
+title: "Authentication"
+description: "Connect your token verifier and use the caller identity safely."
+---
+
+import { Tab, Tabs } from "fumadocs-ui/components/tabs";
+
+Tether works with the authentication system you already have. It doesn't issue tokens, render login forms, or store passwords. Instead, you give Tether a verifier that turns a token into a user ID, and Tether attaches that ID to the connection.
+
+To set this up, implement `tether.Auth` and call `engine.SetAuth` before serving requests.
+
+## Verify tokens on the server
+
+The adapter below hands each token to your existing verification code. Your `Verify` function should check everything your system requires: the signature or session record, expiration, and any issuer or audience rules.
+
+```go
+import (
+    "context"
+    "errors"
+    "time"
+
+    "gorm.io/gorm"
+)
+
+type TokenAuth struct {
+    Verify         func(context.Context, string) (string, time.Time, error)
+    AllowAnonymous bool
+}
+
+func (a TokenAuth) VerifyToken(ctx context.Context, _ *gorm.DB, token string) (string, time.Time, error) {
+    if token == "" {
+        if a.AllowAnonymous {
+            return "", time.Time{}, nil
+        }
+        return "", time.Time{}, errors.New("sign in required")
+    }
+    userID, expiresAt, err := a.Verify(ctx, token)
+    if err != nil || userID == "" {
+        return "", time.Time{}, errors.New("invalid credentials")
+    }
+    if !expiresAt.IsZero() && !expiresAt.After(time.Now()) {
+        return "", time.Time{}, errors.New("expired credentials")
+    }
+    return userID, expiresAt, nil
+}
+
+// During startup, with your application's verify function:
+// engine.SetAuth(TokenAuth{Verify: verify, AllowAnonymous: true})
+```
+
+`VerifyToken` returns the caller's user ID and when that identity expires. A zero expiry means it never expires on its own. It also receives the engine's database handle and a context that is cancelled when the engine shuts down. Never use the raw token text as a user ID without verifying it.
+
+Returning an error rejects the token. The error text is logged on the server; the client receives a generic `Failed to get user ID` message.
+
+If you don't call `SetAuth`, Tether uses a default verifier that accepts every token and treats every caller as anonymous. That's fine for public demos, but it isn't a login system.
+
+## Decide whether to allow anonymous visitors
+
+The client sends a token each time it connects. Before your app provides one, that token is an empty string. How your verifier treats the empty token affects what the client reports:
+
+| Your verifier, given `""` | Client `authState` before sign-in |
+| --- | --- |
+| Returns `"", time.Time{}, nil` (accepts anonymous) | `authenticated: true`, `userId: null` |
+| Returns an error (requires sign-in) | `authenticated: false`, `userId: null` |
+
+Either choice is valid. If you accept anonymous visitors, `authenticated` means "connected and accepted", not "signed in". Check `userId` when you need to know whether someone is actually signed in. If you reject the empty token, `authenticated` becomes true only after a real sign-in.
+
+On the server, both choices behave the same way for requests. A connection without a verified user is anonymous, and `GetIdentity()` returns `""`. Rejecting the empty token does **not** stop anonymous clients from calling your queries and mutations. Every handler that serves private data still needs its own [identity or guard check](#require-a-signed-in-user).
+
+## Send a token from the client
+
+<Tabs items={["React", "TypeScript"]}>
+<Tab value="React">
+
+```tsx
+import { useEffect } from "react";
+import { Authenticated, Unauthenticated, useTether } from "@tetherdb/react";
+
+// Render under TetherProvider. token comes from your login/session system.
+export function Session({ token }: { token: string | null }) {
+  const { setToken, logout, authState } = useTether();
+  useEffect(() => {
+    if (token) setToken(token);
+  }, [token, setToken]);
+
+  return <>
+    <Authenticated>
+      <p>{authState.userId ? `Signed in as ${authState.userId}` : "Browsing anonymously"}</p>
+      <button onClick={() => logout()}>Sign out</button>
+    </Authenticated>
+    <Unauthenticated>
+      <p>Please sign in.</p>
+    </Unauthenticated>
+    {authState.error && <p role="alert">{authState.error}</p>}
+  </>;
+}
+```
+
+`<Authenticated>` renders its children when `authState.authenticated` is true, and `<Unauthenticated>` renders when it is false. See [the table above](#decide-whether-to-allow-anonymous-visitors) for what that means with your verifier. If you accept anonymous visitors, `<Authenticated>` also renders for them, so check `authState.userId` inside it as the example does. These components only control what's displayed; they don't protect any data.
+
+The provider keeps the token in memory only. It doesn't save or refresh tokens for you. When a user signs out, clear your own login state and call `logout()`. Setting an empty token isn't enough.
+
+</Tab>
+<Tab value="TypeScript">
+
+```ts
+// client is your connected TetherClient; token comes from your login system.
+client.setToken(token);
+const stopWatchingAuth = client.onAuthentication(state => {
+  console.log(state.authenticated, state.userId, state.error);
+});
+
+// When the user signs out:
+// client.logout();
+// When you no longer need auth updates:
+// stopWatchingAuth();
+```
+
+`setToken` doesn't return a promise. To find out whether the token was accepted, watch the authentication state. The `onAuthentication` callback runs immediately with the current state and again whenever it changes.
+
+`authenticated` depends on how your verifier treats anonymous visitors; see [the table above](#decide-whether-to-allow-anonymous-visitors). Check `userId` when you need to know whether a real user is signed in.
+
+</Tab>
+</Tabs>
+
+## Require a signed-in user
+
+```go
+userID, err := ctx.Auth.GetIdentity()
+if err != nil || userID == "" {
+    return nil, errors.New("authentication required")
+}
+```
+
+For an anonymous caller, `GetIdentity()` returns an **empty ID with no error**. If you check only `err`, anonymous callers get through, so check `userID == ""` as well.
+
+Scheduled and internal executions have no caller. There, `GetIdentity()` returns `tether.ErrNoCaller`.
+
+Calling `GetIdentity()` in a query makes that query's result user-specific, so Tether stops sharing it between users. That's correct for personal data like "my profile" or "my drafts". For permission checks, and for data many users can share, use a [guard](./guards.mdx) instead.
+
+## Identity changes, expiry, and sign-out
+
+When a connection's identity changes, Tether re-runs that connection's subscriptions as the new user.
+
+When an identity reaches its expiry time, the server switches the connection back to anonymous and re-runs its subscriptions. Tether doesn't refresh tokens. Get a fresh token from your auth system and pass it to `setToken`.
+
+A rejected token leaves the connection's current identity in place on the server. For example, if a signed-in user's replacement token fails, the client reports them as signed out, but the server still treats the connection as that user. To sign out, use the client's `logout()`. It clears local query and auth state and opens a new connection, so the old identity can't linger on the server.
+
+Next, use [guards](./guards.mdx) to control who can read and change each resource.

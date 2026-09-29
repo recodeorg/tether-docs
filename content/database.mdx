@@ -1,0 +1,70 @@
+---
+title: "Database and models"
+description: "Define GORM models, register tables, and choose SQLite or PostgreSQL."
+---
+
+Tether is built on GORM. At startup, open your database, pass it to `tether.NewEngine`, then create tables and register your functions before serving requests.
+
+Give each engine its own GORM handle. The engine adds callbacks and connection wrappers to the handle it receives, so one handle shouldn't be passed to two engines.
+
+## Models and JSON
+
+```go
+type Message struct {
+    ID     uint   `gorm:"primaryKey" json:"id"`
+    RoomID string `gorm:"index" tether:"track" json:"roomId"`
+    Body   string `json:"body"`
+}
+
+if err := engine.CreateTable(&Message{}); err != nil {
+    return err
+}
+```
+
+`CreateTable` runs GORM's `AutoMigrate` for the model and returns any migration error.
+
+Tether tracks primary keys automatically. The `tether:"track"` tag lets you use a field for [collection tracking](./reactivity.mdx), such as "all messages in this room". The tag doesn't create a database index, so add `gorm:"index"` yourself for columns you filter on often.
+
+A field has two names: one in JSON and one in the database. The model above appears as `roomId` to clients but as `room_id` in SQL and in tracking calls. Be careful about what you return. Leave out password hashes and internal fields with `json:"-"`, or return a separate response struct.
+
+## SQLite
+
+```go
+import "github.com/glebarez/sqlite"
+
+// Inside your startup function:
+db, err := gorm.Open(sqlite.Open("app.db"), &gorm.Config{})
+if err != nil {
+    return err
+}
+```
+
+SQLite supports a single engine instance. Keep the database file on persistent disk.
+
+The quick start limits the connection pool to one connection so writes happen one at a time. Tune this for your app's workload. For tests with in-memory SQLite, use a shared-memory DSN or a single connection. Otherwise each pooled connection gets its own empty database.
+
+## PostgreSQL
+
+```go
+import "gorm.io/driver/postgres"
+
+// Inside your startup function; dsn comes from your environment:
+db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+if err != nil {
+    return err
+}
+engine, err := tether.NewEngine(db)
+if err != nil {
+    return err
+}
+```
+
+PostgreSQL lets several engine instances share a database and keep each other's subscribers up to date. Tether reads the DSN from the GORM dialector to open its own notification listener, so use the standard `gorm.io/driver/postgres` dialector. Test the same connection path, including any proxy, that you'll use in production.
+
+Switching from SQLite to PostgreSQL doesn't copy your data; plan that migration separately. `AutoMigrate` is convenient, but it isn't a production migration plan. Roll out schema changes before deploying code that depends on them.
+
+## Writes and tracking
+
+Make writes with GORM's model methods through the engine's handle, usually `ctx.DB`. Tether uses the model information in those calls to know which queries to refresh. Writes from other programs, and raw SQL that bypasses GORM's model callbacks, won't trigger updates. Route reactive writes through Tether mutations, and explicitly track tables or collections for reads like counts and aggregates.
+
+Log database errors on the server, with sensitive values redacted. Return simple, safe error messages from public handlers so SQL and connection details never reach clients.

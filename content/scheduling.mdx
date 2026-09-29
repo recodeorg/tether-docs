@@ -1,0 +1,88 @@
+---
+title: "Scheduling and internal functions"
+description: "Run mutations later or on a persistent cron schedule."
+---
+
+Tether can run a mutation later, or on a repeating schedule. Scheduled tasks are saved in the `tether_tasks` table, so they survive restarts. With PostgreSQL, instances agree on who runs each task, so a task doesn't run on every server. Register the target mutation on every instance that might run it.
+
+## Register a server-only mutation
+
+```go
+engine.RegisterMutation("pruneMessages", func(ctx *tether.MutationCtx) (any, error) {
+    // Application policy: delete messages matching this retention marker.
+    err := ctx.DB.Where("body = ?", "[expired]").Delete(&Message{}).Error
+    return nil, err
+}, tether.Internal())
+```
+
+`Internal()` hides the mutation from clients. A client that calls it gets the same error as for a name that doesn't exist. The scheduler and the profiler's flush callback can still run it.
+
+Tether currently has no API for calling a mutation from your own server code. To share logic between mutations, use ordinary Go functions.
+
+## Run after a delay
+
+From a mutation that has already checked the caller may request this work:
+
+```go
+taskID, err := ctx.Scheduler.RunAfter(
+    10 * time.Minute,
+    "pruneMessages",
+    map[string]interface{}{},
+)
+if err != nil {
+    return nil, errors.New("could not schedule cleanup")
+}
+return taskID, nil
+```
+
+Save the task ID if you might need to cancel the task. Params are stored as JSON, so numbers arrive as `float64`.
+
+The scheduled mutation doesn't run as the user who scheduled it; it has no caller at all. Pass any IDs it needs, such as a user or room ID, in its params. Also decide whether it should re-check permissions when it runs.
+
+`RunAfter` saves the task separately from any transaction on `ctx.DB`, so rolling back doesn't cancel it. See [Transactions](./transactions.mdx) for safe patterns and a SQLite pitfall.
+
+## Recurring jobs
+
+Register crons during startup, after registering their mutations:
+
+```go
+cronID, err := engine.RegisterCron(
+    "nightly-prune",
+    "0 2 * * *",
+    "pruneMessages",
+    map[string]interface{}{},
+)
+if err != nil {
+    return err
+}
+_ = cronID // persist or retain this if the app supports cancellation
+```
+
+Cron expressions have five fields: minute, hour, day of month, month, and day of week. They use the server's local time zone, so set the same zone on every instance. UTC is a common choice.
+
+Registering a cron with an existing name updates its schedule, mutation, and params, and returns the same task ID. That's why it's safe to register crons on every startup.
+
+If the server was down when a cron should have run, it runs once when an engine next checks for due tasks. Missed runs aren't replayed one by one.
+
+`RegisterCron` doesn't check that the mutation name exists. A typo shows up as an error in the logs when the cron runs. Keep names consistent across deployments.
+
+## Cancel work
+
+From an authorized mutation:
+
+```go
+cancelled := ctx.Scheduler.Cancel(taskID)
+return cancelled, nil
+```
+
+`Cancel` removes a one-time task or a cron. It returns false if the task has already started on this engine or couldn't be deleted. It can't stop a task that's already running on another engine. To get rid of a cron for good, also remove its `RegisterCron` call, or the next startup will recreate it.
+
+## Guarantees and failures
+
+Scheduled mutations have no caller. `GetIdentity()` returns `tether.ErrNoCaller`, and `ExecuteGuard` isn't available. Treat them as trusted server code that gets everything it needs from its params.
+
+Under normal operation, each task runs on one instance. After a crash or a stalled server, though, a task can run twice. Write jobs so that running them twice is harmless.
+
+A one-time task is removed after it runs, even if the mutation returned an error. Tether doesn't retry it. If you need retries, log the failure and schedule a new attempt yourself. A failing cron simply moves on to its next scheduled time.
+
+`engine.Close()` waits for running tasks to finish, then stops scheduling. It releases tasks it had claimed but not started, so another instance can pick them up, and it doesn't delete any saved tasks. If an engine stops without closing cleanly, its claimed tasks become available again after a timeout. Scheduling after `Close` returns `tether.ErrEngineClosed`.

@@ -1,0 +1,104 @@
+---
+title: "Go API reference"
+description: "The public engine, context, storage, and profiler APIs at a glance."
+---
+
+Import the engine as `github.com/recodeorg/tether`. Call every `Register*`, `Set*`, and `CreateTable` method during startup, before you serve requests. They aren't safe to call while the engine is handling traffic.
+
+## Engine
+
+| API | Purpose |
+| --- | --- |
+| `NewEngine(db *gorm.DB, options ...EngineOption) (*Engine, error)` | Installs tracking and starts background work; SQLite or PostgreSQL required |
+| `CreateTable(model interface{}) error` | Runs GORM AutoMigrate for a model |
+| `RegisterQuery(name string, fn func(*QueryCtx) (any, error), opts ...Option)` | Registers a read-only live query |
+| `RegisterMutation(name string, fn func(*MutationCtx) (any, error), opts ...Option)` | Registers a writable command |
+| `RegisterGuard(name string, fn func(*GuardCtx) (any, error), opts ...GuardOption)` | Registers a reactive permission check or authorized data lookup |
+| `Internal() Option` | Hides a query or mutation from client calls |
+| `SetAuth(auth Auth)` | Installs the token verifier |
+| `SetAllowedOrigins(origins []string)` | Sets exact allowed browser origins for WebSockets and storage |
+| `SetCheckOrigin(check func(*http.Request) bool)` | Sets a custom origin policy |
+| `Handle(w http.ResponseWriter, r *http.Request)` | Serves the WebSocket endpoint |
+| `SetStorage(adapter storage.StorageAdapter, basePath string, defaults ...storage.UploadOption) error` | Configures storage once |
+| `StorageHandler(w http.ResponseWriter, r *http.Request)` | Serves the full storage path prefix |
+| `RegisterCron(name, expression, mutation string, params map[string]interface{}) (string, error)` | Creates or updates a named recurring task |
+| `Profiler() *Profiler` | Returns the engine profiler |
+| `EphemeralID() string` | Identifies this engine process instance, not a stable application ID |
+| `Close()` | Stops engine background work; safe to call repeatedly |
+
+Registering two queries, two mutations, or two guards with the same name panics. `EngineOption` and `GuardOption` are placeholders for future options; Tether currently doesn't define any.
+
+There's no `ExecuteQuery` or `ExecuteMutation` API for calling handlers from your own code. Only the scheduler and profiler can run mutations internally. To share logic, use ordinary Go functions.
+
+## Handler contexts
+
+| Capability | QueryCtx | MutationCtx | GuardCtx |
+| --- | --- | --- | --- |
+| `DB *gorm.DB` | Read-only | Read/write | Read-only |
+| `Params map[string]interface{}` | Client JSON | Client or scheduled JSON | Guard params |
+| `Auth *AuthCtx` | Identity and guards | Identity and guards for client calls | Identity only |
+| `TrackCollection(table, column string, value interface{})` | Yes | — | Yes |
+| `TrackTable(table string)` | Yes | — | Yes |
+| `Storage *StorageCtx` | Download URL only | Upload, download, delete | — |
+| `Scheduler *SchedulerCtx` | — | Yes | — |
+| `Profiler *Profiler` | — | Yes | — |
+
+JSON numbers decode as `float64`. Always use the two-value form of type assertions (`v, ok := ctx.Params["x"].(string)`) on client params. The single-value form panics on unexpected input.
+
+## Auth
+
+Implement:
+
+```go
+type Auth interface {
+    VerifyToken(context.Context, *gorm.DB, string) (string, time.Time, error)
+}
+```
+
+`VerifyToken` receives an empty string when the client hasn't set a token. Return no error to accept anonymous visitors, or an error to require sign-in.
+
+- `AuthCtx.GetIdentity() (string, error)` returns `""` for anonymous callers and `ErrNoCaller` in scheduled or internal executions. In a query, it makes the result user-specific and prevents sharing it across users.
+- `AuthCtx.ExecuteGuard(name string, params map[string]interface{}) (interface{}, error)` runs a guard and returns its JSON-normalized result. It isn't available inside guards or in executions without a caller.
+
+See [Authentication](./authentication.mdx) and [Guards](./guards.mdx) for details.
+
+## Scheduler
+
+- `RunAfter(delay time.Duration, mutation string, params map[string]interface{}) (string, error)`
+- `Cancel(taskID string) bool`
+
+These are fields on `SchedulerCtx`. Tasks are saved outside the current database transaction and run without a caller. See [Scheduling](./scheduling.mdx).
+
+## Storage
+
+Fields on `StorageCtx`:
+
+- `GetUploadURL(opts ...storage.UploadOption) (storage.UploadInfo, error)`
+- `GetDownloadURL(fileID string) (string, error)`
+- `DeleteFile(fileID string) error`
+
+`UploadInfo` has `FileID` and `UploadURL` fields serialized as `fileID` and `uploadURL`. Options are `storage.WithMaxBytes(int64)` and `storage.WithExpiresIn(time.Duration)`.
+
+Adapters: `local.New(directory string) (*local.Storage, error)` and `s3.New(context.Context, s3.Config) (*s3.Storage, error)`. Import their packages under `github.com/recodeorg/tether/storage/`. See [File storage](./storage.mdx).
+
+## Profiler
+
+- `Start() error` and `StartWithCallback(interval time.Duration, mutation string) error`
+- `IsActive() bool`, `Stop()`, `Add(Metric)`
+- `DumpMetricsAndFlush() []Metric`
+- `tether.SanitizeMetrics([]Metric) ProfileReport`
+- `ProfileReport.Slowest(n int) []ProfiledExecution` and `ProfileReport.String() string`
+
+See [Profiling](./profiling.mdx) for buffer limits and capture lifecycle.
+
+## Exported operational models and errors
+
+`TetherTask`, `TetherStorage`, and `TetherDownloadToken` are the models for tables the engine manages. Read them for inspection and debugging, but don't modify task claims or tokens yourself.
+
+| Error | Returned when |
+| --- | --- |
+| `tether.ErrEngineClosed` | You schedule or configure work after `Close` |
+| `tether.ErrNoCaller` | `GetIdentity()` is called in a mutation with no caller, such as a scheduled one |
+| `tether.ErrProfilerRunning` | You start a profiler that's already running |
+
+Check the errors returned during startup, migration, storage, and scheduling instead of discarding them.

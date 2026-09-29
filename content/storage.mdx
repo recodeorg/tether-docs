@@ -1,0 +1,171 @@
+---
+title: "File storage"
+description: "Upload raw bytes using short-lived URLs and choose local disk or S3."
+---
+
+import { Tab, Tabs } from "fumadocs-ui/components/tabs";
+
+Tether keeps file metadata in your database and file contents in a storage adapter, such as local disk or S3. An upload has three steps:
+
+1. A mutation checks that the caller may upload, then creates an upload URL.
+2. The client sends the file's bytes to that URL with an HTTP `PUT`.
+3. Your app saves the returned file ID in its own data, such as on a message or profile.
+
+## Configure local storage
+
+During startup, before serving requests:
+
+```go
+import (
+    "github.com/recodeorg/tether/storage"
+    "github.com/recodeorg/tether/storage/local"
+)
+
+// Inside your startup function:
+files, err := local.New("./uploads")
+if err != nil {
+    return err
+}
+if err := engine.SetStorage(files, "/storage", storage.WithMaxBytes(5 * 1024 * 1024)); err != nil {
+    return err
+}
+mux.HandleFunc("/storage/", engine.StorageHandler)
+```
+
+Mount the handler on the full path prefix, and don't wrap it in `http.StripPrefix`. If you pass an empty path, it defaults to `/storage`.
+
+Call `SetStorage` only once. It creates Tether's storage tables and starts a background cleanup of expired download links and abandoned uploads.
+
+## Issue an upload URL
+
+```go
+engine.RegisterMutation("createUpload", func(ctx *tether.MutationCtx) (any, error) {
+    userID, err := ctx.Auth.GetIdentity()
+    if err != nil || userID == "" {
+        return nil, errors.New("authentication required")
+    }
+    return ctx.Storage.GetUploadURL(
+        storage.WithMaxBytes(2 * 1024 * 1024),
+        storage.WithExpiresIn(5 * time.Minute),
+    )
+})
+```
+
+The sign-in check only works once you've set up a [token verifier](./authentication.mdx). The mutation returns `{ fileID, uploadURL }` to the client.
+
+Anyone who has the upload URL can use it once, so don't log it or share it. Tether doesn't record who a file belongs to. Save the file ID alongside the user in your own tables, and check that link before letting someone attach or delete the file.
+
+By default, a file can be up to **20 MiB**, and the upload must start within **15 minutes**. Options passed to `SetStorage` override those defaults. Options passed to `GetUploadURL` then override them for a single upload. A value of zero means "use the built-in default".
+
+## Upload from the browser
+
+Both examples assume the user is signed in. `uploadURL` is a path like `/storage/...`, not a full URL. If your frontend is served from a different origin than your Go server, combine the path with the server's address.
+
+<Tabs items={["React", "TypeScript"]}>
+<Tab value="React">
+
+```tsx
+import { useState } from "react";
+import { useMutation } from "@tetherdb/react";
+
+type Upload = { fileID: string; uploadURL: string };
+
+export function UploadFile() {
+  const { mutate } = useMutation<Record<string, never>, Upload>("createUpload");
+  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(false);
+  return <>
+    <input type="file" disabled={busy} onChange={async event => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      setBusy(true);
+      try {
+        const info = await mutate({});
+        const response = await fetch(new URL(info.uploadURL, "http://localhost:8080"), {
+          method: "PUT",
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: file,
+        });
+        if (!response.ok) throw new Error(`Upload failed: ${response.status}`);
+        setStatus(`Uploaded ${info.fileID}`);
+        // Attach info.fileID through an authorized application mutation.
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : String(error));
+      } finally {
+        setBusy(false);
+      }
+    }} />
+    <p role="status">{status}</p>
+  </>;
+}
+```
+
+</Tab>
+<Tab value="TypeScript">
+
+```ts
+// client is connected and authenticated; file is a browser File.
+const info = await client.sendMutation("createUpload", {}) as {
+  fileID: string; uploadURL: string;
+};
+const response = await fetch(new URL(info.uploadURL, "http://localhost:8080"), {
+  method: "PUT",
+  headers: { "Content-Type": file.type || "application/octet-stream" },
+  body: file,
+});
+if (!response.ok) throw new Error(`Upload failed: ${response.status}`);
+// Attach info.fileID through an authorized application mutation.
+```
+
+Handle promise failures in the surrounding event handler or application error boundary.
+
+</Tab>
+</Tabs>
+
+Send the file itself as the request body, not `FormData`. Files upload over plain HTTP, not the WebSocket, so the WebSocket's message size limit doesn't apply. If the frontend runs on a different origin, list it in `SetAllowedOrigins`. That setting covers storage requests as well as WebSocket connections.
+
+## Downloads and deletion
+
+To let someone download a file, first check that they're allowed to read it. Then call `ctx.Storage.GetDownloadURL(fileID)` from a query or mutation. You get a path that works for 15 minutes.
+
+`GetDownloadURL` doesn't check whether the file exists or who owns it. That's up to you. Anyone with the link can use it until it expires, even if their access is revoked in the meantime.
+
+Like upload URLs, download URLs are paths. Combine them with your server's address before using them as links. A query that returns a download URL won't re-run when the URL expires. It's usually better to create the URL when the user clicks download, using a mutation that checks permission.
+
+To delete a file, call `ctx.Storage.DeleteFile(fileID)` from a mutation that checks permission. This removes the file's contents and metadata and invalidates its download links. Queries can't create upload URLs or delete files. If storage isn't configured, every storage call returns an error.
+
+## S3-compatible storage
+
+Replace adapter construction with:
+
+```go
+import "github.com/recodeorg/tether/storage/s3"
+
+// Inside startup:
+files, err := s3.New(context.Background(), s3.Config{
+    Region: "us-east-1",
+    Bucket: "my-tether-files",
+    // Endpoint: "https://your-s3-compatible-endpoint",
+})
+if err != nil {
+    return err
+}
+if err := engine.SetStorage(files, "/storage"); err != nil {
+    return err
+}
+```
+
+Credentials come from the standard AWS SDK configuration: environment variables, shared config files, or an instance role. A custom endpoint must use HTTPS. The adapter uses path-style requests.
+
+Uploads still pass through your Go server on their way to S3, so keep routing `/storage/` to it. Every instance must use the same bucket. Switching adapters doesn't copy files that are already stored.
+
+## Custom adapters
+
+To support another backend, implement `storage.StorageAdapter`:
+
+- `UploadStream(context.Context, string, string, *http.Request) error`: read the file from `r.Body`. The engine enforces size limits on it.
+- `ServeFile(string, http.ResponseWriter, *http.Request) error`: write the file to the response.
+- `Delete(context.Context, string) error`: remove the file. Deleting a file that doesn't exist should succeed.
+- `Name() string`: identify the adapter.
+
+Use the file IDs Tether gives you as storage keys. The engine handles metadata, URL tokens, and access checks on the storage routes.

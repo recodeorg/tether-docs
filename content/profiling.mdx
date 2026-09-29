@@ -1,0 +1,66 @@
+---
+title: "Profiling"
+description: "Inspect query, mutation, guard, and database work."
+---
+
+Every engine includes a profiler, which is off until you start it. Use it to see which executions are slow and how much database, caching, and routing work each one does.
+
+## Capture a session
+
+```go
+profiler := engine.Profiler()
+if err := profiler.Start(); err != nil {
+    return err
+}
+
+// Exercise the application, then collect the capture:
+profiler.Stop()
+report := tether.SanitizeMetrics(profiler.DumpMetricsAndFlush())
+log.Print(report.String())
+for _, execution := range report.Slowest(10) {
+    log.Printf("%+v", execution)
+}
+```
+
+- `Stop` stops recording but keeps what was captured.
+- `DumpMetricsAndFlush` returns the captured metrics and clears the buffer.
+- `SanitizeMetrics` groups raw metrics by execution and computes totals.
+- `Slowest(n)` returns the `n` slowest executions.
+
+Each raw metric includes an execution ID, name, duration, value, type, and dependency tags.
+
+## Flush periodically
+
+To keep collecting over time, register an internal mutation that handles each batch, then start the profiler with a callback:
+
+```go
+engine.RegisterMutation("flushProfile", func(ctx *tether.MutationCtx) (any, error) {
+    report := tether.SanitizeMetrics(ctx.Profiler.DumpMetricsAndFlush())
+    log.Print(report.String())
+    return nil, nil
+}, tether.Internal())
+
+if err := engine.Profiler().StartWithCallback(30 * time.Second, "flushProfile"); err != nil {
+    return err
+}
+```
+
+The interval must be positive. The callback runs with no params and no caller, and it must call `DumpMetricsAndFlush` itself. Starting a profiler that's already running returns `tether.ErrProfilerRunning`.
+
+The buffer holds up to 100,000 metrics. Once it's full, new metrics are dropped until it's flushed. Pick an interval that keeps up with your traffic, and don't leave the profiler running without something flushing it.
+
+## Match database logs to handlers
+
+For every execution it traces, the engine puts `tether.ContextKeyExecutionID` and `tether.ContextKeyActionName` on the GORM statement context. Your own GORM callbacks or loggers can read these to tie each SQL statement to the query, guard, or mutation that ran it.
+
+## Keep profiling data private
+
+Tether redacts auth tokens from its metrics, but other output can still contain sensitive details. SQL logs, dependency tags, and your own metric names may include user or record IDs. Keep profiler output on the server and limit who can see it.
+
+## What to look for
+
+Start with:
+
+- slow queries and missing indexes,
+- [table dependencies](./reactivity.mdx) that re-run queries more often than needed,
+- queries that call `GetIdentity()` when a [guard](./guards.mdx#why-guards-scale-better-than-getidentity) would let users share one execution. Watch `batch_execution` routing metrics to see how many subscribers each execution served.

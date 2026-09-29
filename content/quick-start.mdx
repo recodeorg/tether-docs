@@ -1,0 +1,249 @@
+---
+title: "Quick start"
+description: "Run a Go server and see live updates in two browser windows."
+---
+
+import { Tab, Tabs } from "fumadocs-ui/components/tabs";
+
+In this guide you'll build a public message board. When anyone posts a message, every open browser shows it immediately, with no polling or manual refetching.
+
+The board lets anyone read and post without signing in. Before using it for private data, add [authentication](./authentication.mdx) and [guards](./guards.mdx).
+
+## 1. Create the Go server
+
+You'll need Go **1.26.8 or newer** for the server and Node.js with npm for the frontend. The example uses `github.com/glebarez/sqlite`, a SQLite driver written in pure Go, so there's no C toolchain to set up.
+
+```sh title="Terminal"
+mkdir tether-demo
+cd tether-demo
+go mod init example.com/tether-demo
+go get github.com/recodeorg/tether github.com/glebarez/sqlite gorm.io/gorm
+```
+
+Create `main.go`:
+
+```go title="main.go"
+package main
+
+import (
+    "errors"
+    "log"
+    "net/http"
+    "strings"
+
+    "github.com/glebarez/sqlite"
+    "github.com/recodeorg/tether"
+    "gorm.io/gorm"
+)
+
+type Message struct {
+    ID   uint   `gorm:"primaryKey" json:"id"`
+    Body string `json:"body"`
+}
+
+func run() error {
+    db, err := gorm.Open(sqlite.Open("app.db"), &gorm.Config{})
+    if err != nil {
+        return err
+    }
+    sqlDB, err := db.DB()
+    if err != nil {
+        return err
+    }
+    defer sqlDB.Close()
+    // Keep SQLite writes serialized for this small demo.
+    sqlDB.SetMaxOpenConns(1)
+
+    engine, err := tether.NewEngine(db)
+    if err != nil {
+        return err
+    }
+    defer engine.Close()
+    if err := engine.CreateTable(&Message{}); err != nil {
+        return err
+    }
+    engine.SetAllowedOrigins([]string{"http://localhost:5173"})
+
+    engine.RegisterQuery("listMessages", func(ctx *tether.QueryCtx) (any, error) {
+        ctx.TrackTable("messages")
+        messages := []Message{}
+        err := ctx.DB.Order("id ASC").Limit(100).Find(&messages).Error
+        return messages, err
+    })
+
+    engine.RegisterMutation("sendMessage", func(ctx *tether.MutationCtx) (any, error) {
+        body, ok := ctx.Params["body"].(string)
+        body = strings.TrimSpace(body)
+        if !ok || len(body) == 0 || len(body) > 1000 {
+            return nil, errors.New("body must contain 1–1000 bytes")
+        }
+        message := Message{Body: body}
+        if err := ctx.DB.Create(&message).Error; err != nil {
+            return nil, errors.New("could not save message")
+        }
+        return message, nil
+    })
+
+    mux := http.NewServeMux()
+    mux.HandleFunc("/tether", engine.Handle)
+    log.Println("Tether listening at ws://localhost:8080/tether")
+    return http.ListenAndServe("localhost:8080", mux)
+}
+
+func main() {
+    if err := run(); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+```sh title="Terminal"
+go run .
+```
+
+A few things to notice:
+
+- `TrackTable("messages")` makes the query re-run whenever a message is added, including the first one.
+- The `json` tags give the response the lowercase property names the client expects.
+- The query returns the first 100 messages in ID order. Adjust it to fit your own pagination needs.
+
+## 2. Connect a client
+
+<Tabs items={["React", "TypeScript"]}>
+<Tab value="React">
+
+In another terminal, create a React + TypeScript app:
+
+```sh
+npm create vite@latest tether-web -- --template react-ts
+cd tether-web
+npm install
+npm install @tetherdb/react
+```
+
+Replace `src/App.tsx`:
+
+```tsx title="src/App.tsx"
+import { useState } from "react";
+import { TetherProvider, useMutation, useQuery } from "@tetherdb/react";
+
+type Message = { id: number; body: string };
+
+function Messages() {
+  const [body, setBody] = useState("");
+  const { data, error } = useQuery<Message[]>("listMessages");
+  const { mutate, isPending, error: sendError } =
+    useMutation<{ body: string }, Message>("sendMessage");
+
+  return (
+    <main>
+      <h1>Live messages</h1>
+      {error ? <p role="alert">{error.message}</p> :
+        data === undefined ? <p>Loading…</p> :
+        <ul>{data.map(message => <li key={message.id}>{message.body}</li>)}</ul>}
+      <form onSubmit={async event => {
+        event.preventDefault();
+        try {
+          await mutate({ body });
+          setBody("");
+        } catch {
+          // useMutation exposes the failure as sendError below.
+        }
+      }}>
+        <input aria-label="Message" value={body}
+          onChange={event => setBody(event.target.value)} />
+        <button disabled={isPending || !body.trim()}>Send</button>
+      </form>
+      {sendError && <p role="alert">{sendError.message}</p>}
+    </main>
+  );
+}
+
+export default function App() {
+  return (
+    <TetherProvider url="ws://localhost:8080/tether">
+      <Messages />
+    </TetherProvider>
+  );
+}
+```
+
+```sh
+npm run dev -- --port 5173 --strictPort
+```
+
+Open `http://localhost:5173` in two browser windows. Send a message in one, and both lists update. `TetherProvider` manages the connection, and `useQuery` subscribes when the component mounts and unsubscribes when it unmounts.
+
+</Tab>
+<Tab value="TypeScript">
+
+For a framework-free browser app:
+
+```sh
+npm create vite@latest tether-web -- --template vanilla-ts
+cd tether-web
+npm install
+npm install @tetherdb/client
+```
+
+Replace `src/main.ts`:
+
+```ts title="src/main.ts"
+import { TetherClient } from "@tetherdb/client";
+
+type Message = { id: number; body: string };
+const client = new TetherClient();
+client.connect("ws://localhost:8080/tether");
+
+const app = document.querySelector<HTMLDivElement>("#app")!;
+app.innerHTML = `<h1>Live messages</h1><ul></ul>
+  <form><input aria-label="Message"><button>Send</button></form><p role="alert"></p>`;
+const list = app.querySelector("ul")!;
+const status = app.querySelector("p")!;
+const input = app.querySelector("input")!;
+
+const unsubscribe = client.subscribe("listMessages", {}, (data, error) => {
+  status.textContent = error?.message ?? "";
+  if (error || data === undefined) return;
+  list.replaceChildren(...(data as Message[]).map(message => {
+    const li = document.createElement("li");
+    li.textContent = message.body;
+    return li;
+  }));
+});
+
+app.querySelector("form")!.onsubmit = async event => {
+  event.preventDefault();
+  try {
+    await client.sendMutation("sendMessage", { body: input.value });
+    input.value = "";
+  } catch (error) {
+    status.textContent = error instanceof Error ? error.message : String(error);
+  }
+};
+
+window.addEventListener("pagehide", () => {
+  unsubscribe();
+  client.disconnect();
+});
+```
+
+```sh
+npm run dev -- --port 5173 --strictPort
+```
+
+Open `http://localhost:5173` in two windows. Send a message in one, and your callback runs in both with the new list. When a view goes away, call the function `subscribe` returned. When the app no longer needs the client, call `disconnect()`.
+
+</Tab>
+</Tabs>
+
+## 3. Follow the data
+
+1. The client subscribes to `listMessages`.
+2. The query reads the messages and tells Tether it depends on the `messages` table.
+3. `sendMessage` inserts a row through the engine's GORM handle.
+4. Once the insert commits, Tether re-runs `listMessages` and sends every subscriber the new list.
+
+The mutation's return value and the refreshed query arrive as separate messages. Render the list from the query, not from the mutation result.
+
+Next, read about [queries](./queries.mdx), [reactivity](./reactivity.mdx), and [guards](./guards.mdx). If the browser can't connect, see [troubleshooting](./troubleshooting.mdx). The usual causes are a mismatched origin or a wrong `/tether` path.

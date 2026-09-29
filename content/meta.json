@@ -1,0 +1,25 @@
+{
+  "pages": [
+    "index",
+    "---Getting started---",
+    "what-is-tether",
+    "quick-start",
+    "---Core concepts---",
+    "database",
+    "queries",
+    "mutations",
+    "reactivity",
+    "---Features---",
+    "authentication",
+    "guards",
+    "transactions",
+    "storage",
+    "scheduling",
+    "profiling",
+    "---Reference & operations---",
+    "clients",
+    "server-api",
+    "deployment",
+    "troubleshooting"
+  ]
+}
