@@ -1,6 +1,6 @@
 ---
 title: "Scheduling and internal functions"
-description: "Run mutations later or on a persistent cron schedule."
+description: "Call server-only functions, run mutations later, or use a persistent cron schedule."
 ---
 
 Tether can run a mutation later, or on a repeating schedule. Scheduled tasks are saved in the `tether_tasks` table, so they survive restarts. With PostgreSQL, instances agree on who runs each task, so a task doesn't run on every server. Register the target mutation on every instance that might run it.
@@ -15,9 +15,31 @@ engine.RegisterMutation("pruneMessages", func(ctx *tether.MutationCtx) (any, err
 }, tether.Internal())
 ```
 
-`Internal()` hides the mutation from clients. A client that calls it gets the same error as for a name that doesn't exist. The scheduler and the profiler's flush callback can still run it.
+`Internal()` hides the mutation from clients. A client that calls it gets the same error as for a name that doesn't exist. The scheduler, crons, the profiler's flush callback, and server-side execution can still run it.
 
-Tether currently has no API for calling a mutation from your own server code. To share logic between mutations, use ordinary Go functions.
+## Run from server code
+
+After registering your functions, call a mutation directly from code that holds the engine, such as a background worker:
+
+```go
+if _, err := engine.ExecuteMutation("pruneMessages", map[string]interface{}{}); err != nil {
+    return err
+}
+```
+
+`engine.ExecuteQuery(name, params)` runs a query once and returns its result. It keeps `ctx.DB` read-only, creates no subscription, and doesn't push the result to clients. `engine.ExecuteMutation(name, params)` returns the mutation's result; writes through its `ctx.DB` refresh subscribed queries just like client mutations. Both can call functions registered with `tether.Internal()`.
+
+Inside a mutation, use `ctx.ExecuteQuery` and `ctx.ExecuteMutation` with the same arguments. For example, an internal mutation can delegate to the cleanup function:
+
+```go
+engine.RegisterMutation("runMaintenance", func(ctx *tether.MutationCtx) (any, error) {
+    return ctx.ExecuteMutation("pruneMessages", map[string]interface{}{})
+}, tether.Internal())
+```
+
+Every direct or nested execution has **no caller**, even when the outer mutation was called by a signed-in client. `GetIdentity()` returns `tether.ErrNoCaller`, and `ExecuteGuard` returns an error. Check permission in the outer public mutation before calling an internal function, and pass any trusted IDs it needs explicitly.
+
+Params pass through unchanged: an `int` supplied by Go stays an `int`, unlike a JSON number sent by a client. Handler errors are returned to the calling code. Nested calls use the engine's database handle; they don't join a transaction you opened on the outer context. For several writes that must commit together, share an ordinary Go helper that accepts your transaction handle.
 
 ## Run after a delay
 

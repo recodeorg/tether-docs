@@ -93,8 +93,10 @@ Keep the function `subscribe` returns and call it when you're done. Subscribing 
 
 `QueryCtx` provides `DB`, `Params`, `Auth`, `Storage`, `TrackCollection`, and `TrackTable`. Its database handle rejects any write. From `Storage`, queries can create download URLs, but uploads and deletions have to happen in a mutation.
 
-Passing `tether.Internal()` to `RegisterQuery` hides the query from clients. Tether currently has no API for running a query from your own server code, so an internal query can't be used as a helper. Write an ordinary Go function for shared logic instead.
+Passing `tether.Internal()` to `RegisterQuery` hides the query from clients. Run it once with `engine.ExecuteQuery(name, params)` or, inside a mutation, `ctx.ExecuteQuery(name, params)`. These calls have no caller, keep `ctx.DB` read-only, and neither subscribe nor push their result to clients. See [server-side execution](./scheduling.mdx#run-from-server-code).
 
 Tether shares one query execution between subscribers when it can, which makes queries cheap to serve at scale. Calling `ctx.Auth.GetIdentity()` in a query turns that sharing off between users. Use [guards](./guards.mdx#why-guards-scale-better-than-getidentity) for permission-dependent data, and read identity directly only for personal results.
+
+For lists that grow over time, see [Pagination](./pagination.mdx). To load data before a view mounts, see [Prefetching](./clients.mdx#prefetching).
 
 Read [Reactivity](./reactivity.mdx) to learn how to handle new rows, empty results, and aggregates.

@@ -1,0 +1,137 @@
+---
+title: "Pagination"
+description: "Load older rows with usePaginatedQuery while keeping loaded pages live."
+---
+
+`usePaginatedQuery` loads a list a page at a time and keeps the loaded pages subscribed. Use it for a chat history or feed where new rows arrive while someone reads older ones. It is available in `@tetherdb/react` 1.2.0.
+
+## Subscribe to pages
+
+```tsx
+import { usePaginatedQuery } from "@tetherdb/react";
+
+type Message = { id: number; roomId: string; body: string };
+
+export function History({ room }: { room: string | null }) {
+  const { data, error, hasMore, loadMore } = usePaginatedQuery<Message>(
+    "getMessagePage", room ? { room } : "pass",
+  );
+  if (!room) return <p>Select a room.</p>;
+  if (error) return <p role="alert">{error.message}</p>;
+  if (data === undefined) return <p>Loading…</p>;
+  return <>
+    <ul>{data.map(message => <li key={message.id}>{message.body}</li>)}</ul>
+    <button disabled={!hasMore} onClick={loadMore}>Load older messages</button>
+  </>;
+}
+```
+
+Render this under `TetherProvider`. The type parameter is one row, not an array or a page response. The hook flattens loaded pages into `data`, newest first. To display a chat oldest first, reverse a copy with `[...data].reverse()`.
+
+`data` starts as `undefined`; an empty array means the query loaded with no rows. Check `error` before displaying data, because the hook may retain previously loaded rows after an error. Passing `"pass"` skips all subscriptions and returns `data: undefined`, `error: null`, and `hasMore: false`.
+
+`loadMore()` requests the next older page when one is available. It returns `void`, not a promise. There is no `isLoadingMore` flag. Existing rows stay visible while another page loads. Changing the query name or params starts a new set of pages; unmounting releases the hook's subscriptions.
+
+## Server response
+
+The hook adds `StartCursor` and `EndCursor` to your params. Both are `null` for the first request. Let the hook manage them rather than supplying your own cursor params.
+
+Return this shape, with the capitalized field names exactly as shown:
+
+```ts
+type MessagePage = {
+  Data: Message[];
+  StartCursor: string | null;
+  EndCursor: string | null;
+  HasMore: boolean;
+  MaxSize: number;
+};
+```
+
+| Field | Meaning |
+| --- | --- |
+| `Data` | Rows in descending order, newest first; return `[]` for an empty page |
+| `StartCursor` | Cursor of the first (newest) returned row, or `null` when empty |
+| `EndCursor` | Cursor of the last (oldest) returned row, or `null` when empty |
+| `HasMore` | More rows match the request's bounds beyond the returned page |
+| `MaxSize` | The positive page size enforced by the server |
+
+Request cursors are **exclusive** bounds. With descending IDs, a non-null `StartCursor` means `id < start`, and a non-null `EndCursor` means `id > end`. Apply both when both are present. Response cursors describe the rows returned, not the request bounds.
+
+The hook uses these bounds to keep older pages live while opening space for new rows. Returning the same page regardless of its cursors breaks that behavior. Choose a stable, unique ordering: a monotonically increasing ID works for this example. If you sort by timestamp, include a unique tie-breaker in the cursor and ordering so rows with the same timestamp aren't skipped.
+
+## Register the query
+
+This example uses the `Message` model from [Database and models](./database.mdx), with increasing numeric IDs, and the `isMember` guard from [Guards](./guards.mdx). Add `errors` and `strconv` to your Go imports.
+
+```go
+engine.RegisterQuery("getMessagePage", func(ctx *tether.QueryCtx) (any, error) {
+    room, ok := ctx.Params["room"].(string)
+    if !ok || room == "" {
+        return nil, errors.New("room is required")
+    }
+    allowed, err := ctx.Auth.ExecuteGuard("isMember", map[string]interface{}{"room": room})
+    if err != nil || allowed != true {
+        return nil, errors.New("forbidden")
+    }
+
+    parseCursor := func(name string) (uint64, error) {
+        value := ctx.Params[name]
+        if value == nil {
+            return 0, nil
+        }
+        text, ok := value.(string)
+        if !ok {
+            return 0, errors.New("invalid cursor")
+        }
+        id, err := strconv.ParseUint(text, 10, 64)
+        if err != nil || id == 0 {
+            return 0, errors.New("invalid cursor")
+        }
+        return id, nil
+    }
+    start, err := parseCursor("StartCursor")
+    if err != nil {
+        return nil, err
+    }
+    end, err := parseCursor("EndCursor")
+    if err != nil {
+        return nil, err
+    }
+
+    const pageSize = 30
+    ctx.TrackCollection("messages", "room_id", room)
+    q := ctx.DB.Where("room_id = ?", room).Order("id DESC")
+    if start != 0 {
+        q = q.Where("id < ?", start)
+    }
+    if end != 0 {
+        q = q.Where("id > ?", end)
+    }
+    messages := []Message{}
+    if err := q.Limit(pageSize + 1).Find(&messages).Error; err != nil {
+        return nil, errors.New("could not load messages")
+    }
+    hasMore := len(messages) > pageSize
+    if hasMore {
+        messages = messages[:pageSize]
+    }
+    var first, last *string
+    if len(messages) > 0 {
+        firstID := strconv.FormatUint(uint64(messages[0].ID), 10)
+        lastID := strconv.FormatUint(uint64(messages[len(messages)-1].ID), 10)
+        first, last = &firstID, &lastID
+    }
+    return map[string]interface{}{
+        "Data": messages,
+        "StartCursor": first,
+        "EndCursor": last,
+        "HasMore": hasMore,
+        "MaxSize": pageSize,
+    }, nil
+})
+```
+
+Reading one extra row lets the query report `HasMore` accurately without returning more than `MaxSize` rows. Tracking the room collection makes all its loaded pages react to inserts and deletions, including pages that are empty. This favors straightforward correctness; large histories can have many active subscriptions and re-runs. The server allows 100 subscriptions per connection, shared with the rest of your app.
+
+For loading before navigation, [prefetch the initial page](./clients.mdx#prefetching) with both cursors set to `null`.

@@ -1,6 +1,6 @@
 # Tether Documentation
 
-V1 documentation for the Go engine and the React/TypeScript clients, built with Fumapress and Fumadocs MDX.
+Documentation for the Go engine 1.3.1, React client 1.2.0, and TypeScript client 1.0.0, built with Fumapress and Fumadocs MDX.
 
 ```sh
 npm ci

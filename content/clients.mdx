@@ -50,15 +50,51 @@ Use `wss://` when your site is served over HTTPS. Tokens are sent inside the con
 | `TetherProvider` | Props: `url`, `children` |
 | `useQuery<T>(name, params?)` | Returns `{ data: T \| undefined, error: TetherError \| null }`; params default to `{}` |
 | `useQuery<T>(name, "pass")` | Skips the subscription and returns the empty result |
+| `usePaginatedQuery<T>(name, params?)` | Returns `{ data: T[] \| undefined, error, hasMore, loadMore }`; accepts `"pass"` to skip. See [Pagination](./pagination.mdx) |
 | `useMutation<TParams, TResult>(name)` | Returns `{ mutate, isPending, error }`; `mutate(params)` resolves to `TResult` or throws |
-| `useTether()` | Returns `{ tetherClient, token, setToken, logout, authState }` |
+| `useTether()` | Returns `{ tetherClient, token, setToken, logout, prefetch, authState, url }` |
 | `Authenticated`, `Unauthenticated` | Render children only when `authState.authenticated` is true or false, respectively. See [what that means for anonymous visitors](./authentication.mdx#decide-whether-to-allow-anonymous-visitors) |
 
-The package also exports the `QueryResult` and `AuthState` types. To use the `TetherError` class, import it from `@tetherdb/client`.
+The package also exports the `QueryResult`, `PaginatedQueryResult`, `Prefetch`, `PrefetchHandle`, `PrefetchOptions`, and `AuthState` types. To use the `TetherError` class, import it from `@tetherdb/client`.
 
-The hooks don't include pagination, optimistic updates, runtime schema validation, or a connection-status hook. If you've used similar libraries, don't assume their APIs exist here. Build those features on top of the methods listed on this page.
+The hooks don't include optimistic updates, runtime schema validation, or a connection-status hook.
 
 A query's `data` starts as `undefined`, and an empty array means it loaded with no results. During server-side rendering, queries have no data; results arrive once the browser connects. In frameworks with client component boundaries, such as the Next.js App Router, put the provider and hooks in client components.
+
+## Prefetching
+
+Use `prefetch` from `useTether()` to subscribe before a view mounts, such as when someone hovers or focuses a room link:
+
+```tsx
+import { useTether } from "@tetherdb/react";
+
+export function RoomLink({ room }: { room: string }) {
+  const { prefetch } = useTether();
+  const warm = () => {
+    prefetch("getMessages", { room }, { ttl: 30_000 });
+  };
+  return <a href={`/rooms/${encodeURIComponent(room)}`}
+    onMouseEnter={warm} onFocus={warm}>{room}</a>;
+}
+```
+
+This uses the ordinary `getMessages` query from [Queries](./queries.mdx). The destination must use the same provider, query name, and params to share its cache. A full page reload creates a new client, so use your router's link component for navigation within the app.
+
+`prefetch<T>(name, params?, options?)` returns `{ ready: Promise<T>, unsubscribe }`. Params default to `{}`. `ttl` is in milliseconds and defaults to **30 seconds**. The subscription stays live until that timer ends or you call `unsubscribe()`, even after `ready` resolves.
+
+`ready` resolves with the first available data, including cached data. It rejects on a query error or if prefetching ends before any data arrives. Catch failures when awaiting it. For a hover hint, you can ignore the handle as above.
+
+Prefetching uses the same subscriptions as `useQuery`. When a view subscribes before the prefetch ends, it keeps the data live. When the last listener leaves, the cache is removed; the TTL doesn't retain data after all subscriptions close. Repeated calls create separate temporary listeners, so avoid starting them during render.
+
+For `usePaginatedQuery`, include the cursor params in the initial prefetch:
+
+```tsx
+const { prefetch } = useTether();
+// In an event handler:
+prefetch("getMessagePage", { room: "general", StartCursor: null, EndCursor: null });
+```
+
+The pagination hook can reuse that initial subscription. It may open additional subscriptions as page bounds change. See [Pagination](./pagination.mdx) for the server contract.
 
 ## TypeScript methods
 

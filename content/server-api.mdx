@@ -14,6 +14,8 @@ Import the engine as `github.com/recodeorg/tether`. Call every `Register*`, `Set
 | `RegisterQuery(name string, fn func(*QueryCtx) (any, error), opts ...Option)` | Registers a read-only live query |
 | `RegisterMutation(name string, fn func(*MutationCtx) (any, error), opts ...Option)` | Registers a writable command |
 | `RegisterGuard(name string, fn func(*GuardCtx) (any, error), opts ...GuardOption)` | Registers a reactive permission check or authorized data lookup |
+| `ExecuteQuery(name string, params map[string]interface{}) (any, error)` | Runs a query once without a caller or subscription, including internal queries |
+| `ExecuteMutation(name string, params map[string]interface{}) (any, error)` | Runs a mutation without a caller, including internal mutations; writes invalidate live queries |
 | `Internal() Option` | Hides a query or mutation from client calls |
 | `SetAuth(auth Auth)` | Installs the token verifier |
 | `SetAllowedOrigins(origins []string)` | Sets exact allowed browser origins for WebSockets and storage |
@@ -28,22 +30,24 @@ Import the engine as `github.com/recodeorg/tether`. Call every `Register*`, `Set
 
 Registering two queries, two mutations, or two guards with the same name panics. `EngineOption` and `GuardOption` are placeholders for future options; Tether currently doesn't define any.
 
-There's no `ExecuteQuery` or `ExecuteMutation` API for calling handlers from your own code. Only the scheduler and profiler can run mutations internally. To share logic, use ordinary Go functions.
+See [server-side execution](./scheduling.mdx#run-from-server-code) for direct and nested calls, auth behavior, and transaction boundaries.
 
 ## Handler contexts
 
 | Capability | QueryCtx | MutationCtx | GuardCtx |
 | --- | --- | --- | --- |
 | `DB *gorm.DB` | Read-only | Read/write | Read-only |
-| `Params map[string]interface{}` | Client JSON | Client or scheduled JSON | Guard params |
+| `Params map[string]interface{}` | Client JSON or server params | Client/scheduled JSON or server params | Guard params |
 | `Auth *AuthCtx` | Identity and guards | Identity and guards for client calls | Identity only |
 | `TrackCollection(table, column string, value interface{})` | Yes | — | Yes |
 | `TrackTable(table string)` | Yes | — | Yes |
-| `Storage *StorageCtx` | Download URL only | Upload, download, delete | — |
+| `Storage *StorageCtx` | Download URL only | Upload, put, download, delete | — |
 | `Scheduler *SchedulerCtx` | — | Yes | — |
 | `Profiler *Profiler` | — | Yes | — |
+| `ExecuteQuery(name string, params map[string]interface{}) (any, error)` | — | Yes, no caller | — |
+| `ExecuteMutation(name string, params map[string]interface{}) (any, error)` | — | Yes, no caller | — |
 
-JSON numbers decode as `float64`. Always use the two-value form of type assertions (`v, ok := ctx.Params["x"].(string)`) on client params. The single-value form panics on unexpected input.
+Client JSON numbers decode as `float64`; params passed to `ExecuteQuery` and `ExecuteMutation` from Go are unchanged. Always use the two-value form of type assertions (`v, ok := ctx.Params["x"].(string)`) on client params. The single-value form panics on unexpected input.
 
 ## Auth
 
@@ -74,10 +78,11 @@ These are fields on `SchedulerCtx`. Tasks are saved outside the current database
 Fields on `StorageCtx`:
 
 - `GetUploadURL(opts ...storage.UploadOption) (storage.UploadInfo, error)`
-- `GetDownloadURL(fileID string) (string, error)`
+- `GetDownloadURL(fileID string, opts ...storage.UploadOption) (string, error)`
 - `DeleteFile(fileID string) error`
+- `PutFile(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error)`
 
-`UploadInfo` has `FileID` and `UploadURL` fields serialized as `fileID` and `uploadURL`. Options are `storage.WithMaxBytes(int64)` and `storage.WithExpiresIn(time.Duration)`.
+`UploadInfo` has `FileID` and `UploadURL` fields serialized as `fileID` and `uploadURL`. Options are `storage.WithMaxBytes(int64)`, `storage.WithExpiresIn(time.Duration)`, `storage.Public()`, `storage.WithDownloadExpiresIn(time.Duration)`, and `storage.UseCachedURLs()`. Upload URLs honor size, upload lifetime, and public visibility; `PutFile` honors only public visibility; download URLs honor download lifetime and caching. All can be supplied as defaults to `SetStorage`.
 
 Adapters: `local.New(directory string) (*local.Storage, error)` and `s3.New(context.Context, s3.Config) (*s3.Storage, error)`. Import their packages under `github.com/recodeorg/tether/storage/`. See [File storage](./storage.mdx).
 
@@ -98,7 +103,7 @@ See [Profiling](./profiling.mdx) for buffer limits and capture lifecycle.
 | Error | Returned when |
 | --- | --- |
 | `tether.ErrEngineClosed` | You schedule or configure work after `Close` |
-| `tether.ErrNoCaller` | `GetIdentity()` is called in a mutation with no caller, such as a scheduled one |
+| `tether.ErrNoCaller` | `GetIdentity()` is called in a query or mutation with no caller, including direct, nested, and scheduled executions |
 | `tether.ErrProfilerRunning` | You start a profiler that's already running |
 
 Check the errors returned during startup, migration, storage, and scheduling instead of discarding them.

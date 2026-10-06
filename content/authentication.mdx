@@ -134,7 +134,7 @@ if err != nil || userID == "" {
 
 For an anonymous caller, `GetIdentity()` returns an **empty ID with no error**. If you check only `err`, anonymous callers get through, so check `userID == ""` as well.
 
-Scheduled and internal executions have no caller. There, `GetIdentity()` returns `tether.ErrNoCaller`.
+Scheduled tasks, crons, and calls through `Engine.ExecuteQuery`, `Engine.ExecuteMutation`, or their `MutationCtx` equivalents have no caller. There, `GetIdentity()` returns `tether.ErrNoCaller`, and `ExecuteGuard` returns an error. A nested execution does not inherit the outer mutation's identity.
 
 Calling `GetIdentity()` in a query makes that query's result user-specific, so Tether stops sharing it between users. That's correct for personal data like "my profile" or "my drafts". For permission checks, and for data many users can share, use a [guard](./guards.mdx) instead.
 

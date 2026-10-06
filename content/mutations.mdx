@@ -86,6 +86,10 @@ try {
 </Tab>
 </Tabs>
 
+## Call another function
+
+A mutation can call `ctx.ExecuteMutation(name, params)` or `ctx.ExecuteQuery(name, params)`, including functions registered with `tether.Internal()`. The nested execution has no caller and doesn't inherit the outer mutation's identity or transaction. Authorize the public entry point before delegating. See [server-side execution](./scheduling.mdx#run-from-server-code) for examples and parameter behavior.
+
 ## Input and output contracts
 
 Treat params as untrusted input: anyone can send any JSON. On the server, check types, lengths, ranges, and whether the caller owns what they're changing. TypeScript types on the client don't validate anything at runtime.

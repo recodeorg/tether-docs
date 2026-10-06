@@ -124,15 +124,58 @@ Handle promise failures in the surrounding event handler or application error bo
 
 Send the file itself as the request body, not `FormData`. Files upload over plain HTTP, not the WebSocket, so the WebSocket's message size limit doesn't apply. If the frontend runs on a different origin, list it in `SetAllowedOrigins`. That setting covers storage requests as well as WebSocket connections.
 
+## Store a file from Go
+
+Use `ctx.Storage.PutFile(contentType, reader, opts...)` in a mutation to save bytes you already have on the server. It returns the file ID, and the file is active immediately, without a separate upload request:
+
+```go
+// Add strings to your imports. Register during startup.
+engine.RegisterMutation("createWelcomeFile", func(ctx *tether.MutationCtx) (any, error) {
+    return ctx.Storage.PutFile("text/plain", strings.NewReader("Welcome!"))
+}, tether.Internal())
+```
+
+Call this from [server code](./scheduling.mdx#run-from-server-code), or check permissions before delegating to it from a public mutation. Save the returned ID in your own data to refer to the file later.
+
+`PutFile` reads the reader to completion. It ignores `WithMaxBytes` and `WithExpiresIn`, so enforce any size limit yourself. It honors `storage.Public()`, including the default passed to `SetStorage`. Queries can't call `PutFile`.
+
+## Public files
+
+Pass `storage.Public()` when issuing an upload URL or storing a file:
+
+```go
+// Inside a mutation that has checked permission to publish a file:
+return ctx.Storage.GetUploadURL(storage.Public())
+```
+
+Once uploaded, the file is available at `GET /storage/public/{fileID}` without a download token. Substitute your configured base path for `/storage`. Private, missing, and not-yet-active files return not found on this route.
+
+Use public files for content anyone may read. Knowing the URL is enough to access them; this route doesn't check your application's membership rules. Passing `storage.Public()` to `SetStorage` makes every later upload or `PutFile` public, so use the per-call option when only some files should be public.
+
 ## Downloads and deletion
 
-To let someone download a file, first check that they're allowed to read it. Then call `ctx.Storage.GetDownloadURL(fileID)` from a query or mutation. You get a path that works for 15 minutes.
+To let someone download a private file, first check that they're allowed to read it. Then call `ctx.Storage.GetDownloadURL(fileID)` from a query or mutation. The returned path works for **15 minutes** by default. Change the lifetime or reuse an existing URL with options:
 
-`GetDownloadURL` doesn't check whether the file exists or who owns it. That's up to you. Anyone with the link can use it until it expires, even if their access is revoked in the meantime.
+```go
+// After checking that the caller may read fileID:
+return ctx.Storage.GetDownloadURL(
+    fileID,
+    storage.WithDownloadExpiresIn(24 * time.Hour),
+    storage.UseCachedURLs(),
+)
+```
 
-Like upload URLs, download URLs are paths. Combine them with your server's address before using them as links. A query that returns a download URL won't re-run when the URL expires. It's usually better to create the URL when the user clicks download, using a mutation that checks permission.
+Both options can also be passed to `SetStorage` as defaults. Per-call options apply after those defaults; a zero download lifetime selects the built-in 15 minutes. `WithExpiresIn` controls upload URLs, while `WithDownloadExpiresIn` controls download URLs.
 
-To delete a file, call `ctx.Storage.DeleteFile(fileID)` from a mutation that checks permission. This removes the file's contents and metadata and invalidates its download links. Queries can't create upload URLs or delete files. If storage isn't configured, every storage call returns an error.
+`UseCachedURLs()` reuses a URL for the same file when more than five minutes remain. Otherwise Tether issues a new one. When a cached URL is reused, a different lifetime on that call doesn't change its expiry. Without this option, each call issues a new token.
+
+A subscribed query that calls `GetDownloadURL` tracks the download token. When storage cleanup removes the expired token, Tether re-runs the query so it can return a fresh link. A one-shot `ExecuteQuery` has no subscription to refresh. If you only need a download on a click, a mutation that checks permission can issue the URL then.
+
+`GetDownloadURL` doesn't check whether the file exists or who owns it. That's up to you. Anyone with the link can use it until it expires, even if their access is revoked in the meantime. Cached URLs are shared by file, not by caller, so authorize every request before obtaining one.
+
+Like upload URLs, download URLs are paths. Combine them with your server's address before using them as links. File responses include `X-Content-Type-Options: nosniff`; unsafe inline types, including SVG, are sent as attachments. Version 1.3.1 also preserves the required headers when the browser reuses cached URLs.
+
+To delete a file, call `ctx.Storage.DeleteFile(fileID)` from a mutation that checks permission. This removes the file's contents and metadata and invalidates its download links. Queries can't create upload URLs, store bytes, or delete files. If storage isn't configured, every storage call returns an error.
 
 ## S3-compatible storage
 
@@ -157,7 +200,7 @@ if err := engine.SetStorage(files, "/storage"); err != nil {
 
 Credentials come from the standard AWS SDK configuration: environment variables, shared config files, or an instance role. A custom endpoint must use HTTPS. The adapter uses path-style requests.
 
-Uploads still pass through your Go server on their way to S3, so keep routing `/storage/` to it. Every instance must use the same bucket. Switching adapters doesn't copy files that are already stored.
+Uploads still pass through your Go server on their way to S3, so keep routing `/storage/` to it. Token-based downloads redirect to a signed S3 URL that expires one minute after the download token. Every instance must use the same bucket. Switching adapters doesn't copy files that are already stored.
 
 ## Custom adapters
 

@@ -105,7 +105,7 @@ A few things to notice:
 
 - `TrackTable("messages")` makes the query re-run whenever a message is added, including the first one.
 - The `json` tags give the response the lowercase property names the client expects.
-- The query returns the first 100 messages in ID order. Adjust it to fit your own pagination needs.
+- The query returns the first 100 messages in ID order. See [Pagination](./pagination.mdx) for a cursor-based query and `usePaginatedQuery`.
 
 ## 2. Connect a client
 
